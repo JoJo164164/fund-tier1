@@ -1,0 +1,27 @@
+# 台灣基金滾動跌幅系統 — Tier1（被動ETF）
+# Streamlit Cloud 部署用 requirements.txt
+#
+# ★ 鎖版政策（自母專案繼承，憲法最高優先）★
+# 母專案血淚：pandas>=2.0.0 開放上限 → Streamlit Cloud 自動抓到 pandas 3.0.3
+#   → 破壞性改版 → app 一啟動即崩 → spawn error → 無限重啟 →「Oh no」。
+# 策略：只精準鎖會出事的（pandas/numpy），其餘維持 >=。
+#   （母專案曾試過全 == 釘死，反因某舊版與 Python 3.14 不相容而整包裝不起來。過猶不及。）
+
+# ── 核心框架 ──
+streamlit>=1.32.0
+# ↓↓↓ 這兩行擋掉 pandas 3.0 破壞性升級，不可放寬 ↓↓↓
+pandas>=2.3.3,<3.0
+numpy>=2.0,<3
+# ↑↑↑ pandas 2.3.3 為 2.x 首個相容 Python 3.14 的版本 ↑↑↑
+
+# ── 資料抓取 ──
+yfinance>=0.2.38
+requests>=2.31.0
+
+# ── 圖表 ──
+plotly>=5.18.0
+
+# ── 註：Tier1 暫未使用以下，待 Tier2（SITCA 解析）再加入 ──
+# beautifulsoup4>=4.12.0
+# lxml>=5.0.0
+# reportlab>=4.0.0        # 若移植母專案 _pdf_* 匯出功能
