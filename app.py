@@ -317,6 +317,109 @@ def fetch_sitca_nav(company: str, date_str: str) -> Tuple[List[dict], str]:
 
 
 # ══════════════════════════════════════════════════════════════
+# 歷史庫讀取（C層：讀 A/B 建的 CSV，供每早掃描用）
+#   資料來源：data/sitca_nav.csv(境內) + data/offshore_nav.csv(境外)
+#   每檔標記境內/境外、投信/發行商，供篩選維度用（憲法：分類篩選後掃描）
+# ══════════════════════════════════════════════════════════════
+HIST_SITCA = "data/sitca_nav.csv"
+HIST_OFFSHORE = "data/offshore_nav.csv"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_history_db() -> Tuple[pd.DataFrame, str]:
+    """讀取歷史庫 CSV（境內+境外合併）。
+
+    回傳：(DataFrame[代碼,日期,淨值,名稱,境內外,發行],  來源說明)
+    找不到檔案時回空表（不報錯，讓 UI 提示去建庫）。
+    """
+    frames = []
+    src_msg = []
+    for path, region, issuer_col in [
+        (HIST_SITCA, "境內", "投信"),
+        (HIST_OFFSHORE, "境外", "來源"),
+    ]:
+        try:
+            df = pd.read_csv(path, dtype=str)
+            if len(df) == 0:
+                continue
+            df["淨值"] = pd.to_numeric(df["淨值"], errors="coerce")
+            df = df.dropna(subset=["淨值"])
+            df["境內外"] = region
+            df["發行"] = df[issuer_col] if issuer_col in df.columns else ""
+            keep = ["代碼", "日期", "淨值", "名稱", "境內外", "發行"]
+            frames.append(df[[c for c in keep if c in df.columns]])
+            src_msg.append("{}({}筆)".format(path.split("/")[-1], len(df)))
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            src_msg.append("{}讀取失敗:{}".format(path, type(e).__name__))
+    if not frames:
+        return pd.DataFrame(columns=["代碼", "日期", "淨值", "名稱", "境內外", "發行"]), \
+            "尚無歷史庫（請先用 GitHub Actions 建庫）"
+    out = pd.concat(frames, ignore_index=True)
+    return out, " + ".join(src_msg)
+
+
+def hist_to_prices(df_one: pd.DataFrame) -> Dict[str, float]:
+    """單檔基金的歷史 DataFrame → {日期:淨值} 字典（回測引擎格式）。"""
+    d = df_one.dropna(subset=["淨值"]).drop_duplicates("日期")
+    return dict(zip(d["日期"].astype(str), d["淨值"].astype(float)))
+
+
+def scan_history_db(df: pd.DataFrame, threshold: float,
+                    max_span: int = MAX_SPAN_DAYS) -> pd.DataFrame:
+    """每早掃描核心：對歷史庫每檔算「最新滾動跌幅」+ 歷史勝率。
+
+    對每檔基金：
+      1. 取最新10筆算當前滾動跌幅 → 是否觸發（≤threshold 且跨度有效）
+      2. 用全部歷史回測該門檻 → 歷史勝率（最佳持有天數）
+      3. 標註淨值截至日（鐵律16）
+    """
+    rows = []
+    for code, g in df.groupby("代碼"):
+        prices = hist_to_prices(g)
+        if len(prices) < ROLL_N + 1:
+            continue
+        rolling = calc_all_rolling_returns(prices, ROLL_N, max_span)
+        if not rolling:
+            continue
+        last = rolling[-1]
+        name = g["名稱"].iloc[0] if "名稱" in g.columns else ""
+        region = g["境內外"].iloc[0] if "境內外" in g.columns else ""
+        issuer = g["發行"].iloc[0] if "發行" in g.columns else ""
+        triggered = last["return"] <= threshold and last["valid"]
+
+        # 歷史勝率（觸發後的最佳持有天數勝率）
+        best_wr, best_h = None, None
+        if triggered:
+            bt = run_full_backtest(prices, threshold, rolling, 0, 0.0, 0.0, max_span)
+            if bt:
+                tbl = build_entry_timing_table(bt)
+                idx = _pick_best_timing_idx(tbl)
+                if idx is not None:
+                    best_wr = tbl.loc[idx, "勝率"]
+                    best_h = tbl.loc[idx, "持有天數"]
+
+        rows.append({
+            "代碼": code, "名稱": str(name)[:28], "境內外": region, "發行": issuer,
+            "分類": classify_etf(code),
+            "滾動10日%": round(last["return"], 2),
+            "觸發": "🔴" if triggered else "",
+            "淨值截至": last["date"],
+            "跨度": last["span_days"],
+            "歷史最佳勝率": best_wr if best_wr else "",
+            "最佳持有天": best_h if best_h else "",
+        })
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    # 觸發的排前面，再按滾動跌幅排序
+    out["_t"] = (out["觸發"] == "🔴").astype(int)
+    out = out.sort_values(["_t", "滾動10日%"], ascending=[False, True]).drop(columns="_t")
+    return out
+
+
+# ══════════════════════════════════════════════════════════════
 # 滾動報酬（鐵律16：10筆 + 曆日跨度 + sanity 上限）
 # ══════════════════════════════════════════════════════════════
 def calc_all_rolling_returns(prices_dict: Dict[str, float],
@@ -690,10 +793,61 @@ def main():
     picks = st.multiselect("選擇標的（僅 Tier1 被動ETF 會產出勝率結論）",
                            codes_all, default=default_sel)
 
-    tabs = st.tabs(["📊 分布校準", "🎯 觸發掃描", "🔬 回測", "📒 追蹤日誌", "🛡️ 系統檢核", "🔌 SITCA 連線測試"])
+    tabs = st.tabs(["☀️ 每早掃描", "📊 分布校準", "🎯 觸發掃描", "🔬 回測", "📒 追蹤日誌", "🛡️ 系統檢核", "🔌 SITCA 連線測試"])
+
+    # ══ Tab0：☀️ 每早掃描（C層 — 每天第一個看的畫面）══
+    with tabs[0]:
+        st.subheader("☀️ 每早掃描 — 今天誰觸發 + 歷史勝率")
+        hist, hsrc = load_history_db()
+        if len(hist) == 0:
+            st.info("**尚無歷史庫。** 這頁需要先用 GitHub Actions 建歷史庫"
+                    "（data/sitca_nav.csv、data/offshore_nav.csv）。"
+                    "建好後這裡會自動讀取，早上打開就能看今天哪些基金觸發跌幅、歷史勝率多少。")
+            st.caption("目前狀態：{}".format(hsrc))
+        else:
+            st.caption("歷史庫：{}".format(hsrc))
+            # 篩選維度（憲法：分類篩選後掃描，先上境內外+發行公司）
+            fc1, fc2, fc3 = st.columns(3)
+            regions = ["全部"] + sorted(hist["境內外"].dropna().unique().tolist())
+            pick_region = fc1.selectbox("境內/境外", regions)
+            issuers = hist["發行"].dropna()
+            if pick_region != "全部":
+                issuers = hist[hist["境內外"] == pick_region]["發行"].dropna()
+            issuer_opts = ["全部"] + sorted([i for i in issuers.unique() if i])
+            pick_issuer = fc2.selectbox("發行公司/投信", issuer_opts)
+            scan_thr = fc3.number_input("觸發門檻(%)", value=-10.0, step=0.5, max_value=0.0)
+
+            view = hist.copy()
+            if pick_region != "全部":
+                view = view[view["境內外"] == pick_region]
+            if pick_issuer != "全部":
+                view = view[view["發行"] == pick_issuer]
+
+            n_funds = view["代碼"].nunique()
+            st.caption("篩選後範圍：{} 檔基金（縮小範圍可加快掃描）".format(n_funds))
+
+            if st.button("☀️ 掃描今日觸發", type="primary"):
+                with st.spinner("掃描 {} 檔，計算滾動跌幅+歷史勝率…".format(n_funds)):
+                    result = scan_history_db(view, scan_thr, MAX_SPAN_DAYS)
+                if len(result) == 0:
+                    st.warning("無足夠歷史資料可掃描。")
+                else:
+                    n_trig = int((result["觸發"] == "🔴").sum())
+                    a, b, c = st.columns(3)
+                    a.metric("掃描檔數", len(result))
+                    b.metric("🔴 今日觸發", n_trig)
+                    c.metric("觸發門檻", "{}%".format(scan_thr))
+                    if n_trig > 0:
+                        st.success("**今天有 {} 檔觸發跌幅** — 下方紅點標記，已配對歷史勝率供你判斷。".format(n_trig))
+                    st.dataframe(result, width="stretch")
+                    st.caption("⚠️ **各檔淨值截至日可能不同**（境外有時差），跨檔比較請看「淨值截至」欄。"
+                               "歷史勝率為觸發後最佳持有天數的回測勝率（樣本≥10才顯示，母專案同源）。")
+                    st.caption("ℹ️ 進場假設觸發日可成交（entry_lag=0，使用者裁決）；"
+                               "費用未計；基金實務申購有截止時點，實際成交價可能不同。")
+
 
     # ══ Tab1：分布校準（憲法：Tier1 第一個產出是分布，不是勝率表）══
-    with tabs[0]:
+    with tabs[1]:
         st.subheader("滾動10日報酬分布 — 先看分布，再訂門檻")
         st.info("**憲法要求**：母專案門檻在台股交易日曆上校準；基金/ETF 非營業日各異、"
                 "視窗跨度浮動，門檻必須先跑分布再訂。**本頁是 Tier1 的第一個產出，不是勝率表。**")
@@ -744,7 +898,7 @@ def main():
                 st.warning("無資料。")
 
     # ══ Tab2：觸發掃描（鐵律16：須註記資料截至日）══
-    with tabs[1]:
+    with tabs[2]:
         st.subheader("現時觸發掃描")
         if st.button("掃描", key="scan"):
             rows = []
@@ -774,7 +928,7 @@ def main():
                 st.warning("無資料。")
 
     # ══ Tab3：回測 ══
-    with tabs[2]:
+    with tabs[3]:
         st.subheader("回測")
         t1_picks = [c for c in picks if is_tier1(c)]
         skipped = [c for c in picks if not is_tier1(c)]
@@ -815,7 +969,7 @@ def main():
                                .format("N", "N"))
 
     # ══ Tab4：追蹤日誌 ══
-    with tabs[3]:
+    with tabs[4]:
         st.subheader("📒 追蹤日誌")
         jdf = load_journal()
         st.caption("欄位（母專案同源）：{}".format("、".join(JOURNAL_COLS)))
@@ -837,7 +991,7 @@ def main():
                     "**④ 全排除後才可稱策略失效**。")
 
     # ══ Tab5：系統檢核 ══
-    with tabs[4]:
+    with tabs[5]:
         st.subheader("🛡️ 系統檢核")
         chk = run_system_checks(adjust, fee_buy, fee_sell, entry_lag)
         st.dataframe(chk, width="stretch")
@@ -849,7 +1003,7 @@ def main():
         st.caption("CRITICAL_CHECKS 與 IMPACT_MAP 中 severity=='error' 項目自動同步（母專案架構）。")
 
     # ══ Tab6：SITCA 連線測試（Tier2 資料源端到端驗證）══
-    with tabs[5]:
+    with tabs[6]:
         st.subheader("🔌 SITCA 境內基金淨值 — 連線測試")
         st.info("**目的**：驗證「境內基金」這條資料源在 Streamlit Cloud 上端到端可用。"
                 "SITCA 是官方唯一來源，一次 POST 回一整家投信的所有基金（含主動ETF）當日淨值。"
