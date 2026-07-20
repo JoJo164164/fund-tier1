@@ -217,17 +217,29 @@ SITCA_COMPANIES = {
     "A0047": "台新投信", "A0048": "合庫投信", "A0049": "大華銀投信", "A0050": "路博邁投信",
 }
 
-# 淨值列解析（自真實回傳 HTML 驗證：<td align='right'>25.49</td> 可正確抽出）
-_SITCA_ROW_RE = re.compile(
-    r"<td align='left'>([A-Z0-9]+)</td>"        # 類型代號
-    r"<td align='left'>(A00\d{2})</td>"          # 公司代號
-    r"<td align='left'>[^<]*</td>"               # 公司名稱
-    r"<td align='left'>(\d{4,6}[A-Z]?)</td>"     # 受益憑證代號=基金代碼
-    r"<td align='left'>\d+</td>"                 # 基金統編
-    r"<td align='left'>([^<]+?)</td>"            # 基金名稱
-    r"<td align='left'>([A-Z]{3})</td>"          # 幣別
-    r"<td align='right'>([\d.]+|\(註\d\)|-)</td>"  # 淨值（可能為註記）
-)
+# 淨值列解析：兩段式（先切<tr>再抽<td>），不受單雙引號/class/align/長名稱影響。
+# 教訓：舊版寫死 align='left'（單引號，來自VIEWSTATE解碼），但SITCA實際回傳用雙引號
+#       → 200+列僅僥倖命中9列。改用兩段式後，用三張真實DOM圖驗證5/5全中。
+def _sitca_parse_rows(html: str) -> List[dict]:
+    out = []
+    for tr in re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.S):
+        if 'DTHeader' in tr or '類型代號' in tr:
+            continue
+        tds = re.findall(r'<td[^>]*>(.*?)</td>', tr, re.S)
+        tds = [re.sub(r'<[^>]+>', '', t).strip() for t in tds]
+        if len(tds) < 8:
+            continue
+        comp, code, fname, cur, nav = tds[1], tds[3], tds[5], tds[6], tds[7]
+        if not re.match(r'^A00\d{2}$', comp):
+            continue
+        out.append({
+            "代碼": code,
+            "分類": classify_etf(code),
+            "幣別": cur,
+            "淨值": nav,
+            "名稱": fname[:30],
+        })
+    return out
 
 
 def _sitca_hidden(html: str, name: str) -> str:
@@ -292,16 +304,7 @@ def fetch_sitca_nav(company: str, date_str: str) -> Tuple[List[dict], str]:
         if r2.status_code != 200:
             return [], "② POST 失敗 status={}".format(r2.status_code)
 
-        rows = _SITCA_ROW_RE.findall(r2.text)
-        out = []
-        for tcode, comp, code, name, cur, nav in rows:
-            out.append({
-                "代碼": code,
-                "分類": classify_etf(code),
-                "幣別": cur,
-                "淨值": nav,
-                "名稱": name.split("<")[0][:30],
-            })
+        out = _sitca_parse_rows(r2.text)
         msg = "✓ 成功：GET+POST 完成，解析 {} 檔（欄位名 日期={} 公司={}）".format(
             len(out), date_name, company_name)
         if not out:
