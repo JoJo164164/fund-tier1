@@ -1,0 +1,62 @@
+name: 建置 SITCA 基金淨值歷史庫
+
+# 讓使用者可在 GitHub 網頁 Actions 分頁手動按「Run workflow」觸發
+on:
+  workflow_dispatch:
+    inputs:
+      companies:
+        description: '投信代碼（逗號分隔）。預設安聯+野村驗證用'
+        required: true
+        default: 'A0036,A0032'
+      days_back:
+        description: '往回抓幾個營業日（驗證用 5；建庫時改大，如 250=約1年）'
+        required: true
+        default: '5'
+      start_date:
+        description: '起始日 YYYYMMDD（留空=昨天）。續抓更早歷史時往前調'
+        required: false
+        default: ''
+      time_budget:
+        description: '本次最多跑幾分鐘（GitHub上限360，建議留緩衝設300）'
+        required: true
+        default: '300'
+
+# 讓 workflow 能把抓到的 CSV commit 回 repo
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # 低於 GitHub 硬上限 360，留緩衝
+    steps:
+      - name: 取出 repo
+        uses: actions/checkout@v4
+
+      - name: 安裝 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安裝相依
+        run: pip install requests
+
+      - name: 執行建庫腳本
+        env:
+          SITCA_COMPANIES: ${{ github.event.inputs.companies }}
+          SITCA_DAYS_BACK: ${{ github.event.inputs.days_back }}
+          SITCA_START: ${{ github.event.inputs.start_date }}
+          SITCA_TIME_BUDGET: ${{ github.event.inputs.time_budget }}
+        run: python build_sitca.py
+
+      - name: 提交結果回 repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --staged --quiet; then
+            echo "無新資料，略過提交"
+          else
+            git commit -m "建庫: SITCA 淨值增量 ($(date +%Y-%m-%d_%H:%M))"
+            git push
+          fi
