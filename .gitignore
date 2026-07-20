@@ -6,3 +6,6 @@ venv/
 .streamlit/secrets.toml
 *.csv
 !sample_*.csv
+# ↓↓↓ 放行建庫產出的歷史庫 csv（data/ 底下），其餘 csv 仍擋 ↓↓↓
+!data/
+!data/*.csv
