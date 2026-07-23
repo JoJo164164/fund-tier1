@@ -5,19 +5,23 @@ on:
   workflow_dispatch:
     inputs:
       companies:
-        description: '投信代碼（逗號分隔）。預設安聯+野村驗證用'
-        required: true
-        default: 'A0036,A0032'
+        description: '★填 ALL =一次查所有公司(最快,請求數1/36)★ ｜留空=逐家抓36家 ｜填代碼=只抓指定家'
+        required: false
+        default: 'ALL'
       days_back:
-        description: '往回抓幾個營業日（驗證用 5；建庫時改大，如 250=約1年）'
+        description: '往回抓幾個營業日。驗證用 5；建1年約250；建15年填 3800'
         required: true
-        default: '5'
+        default: '250'
+      skip_recent:
+        description: '跳過最近幾個營業日(避開境外淨值未齊,隔天4點後才齊)。預設2'
+        required: true
+        default: '2'
       start_date:
-        description: '起始日 YYYYMMDD（留空=昨天）。續抓更早歷史時往前調'
+        description: '起始日 YYYYMMDD(留空=從今天往回跳skip_recent天)。續抓更早歷史往前調'
         required: false
         default: ''
       time_budget:
-        description: '本次最多跑幾分鐘（GitHub上限360，建議留緩衝設300）'
+        description: '本次最多跑幾分鐘(上限360,建議300留緩衝)'
         required: true
         default: '300'
 
@@ -45,6 +49,7 @@ jobs:
         env:
           SITCA_COMPANIES: ${{ github.event.inputs.companies }}
           SITCA_DAYS_BACK: ${{ github.event.inputs.days_back }}
+          SITCA_SKIP_RECENT: ${{ github.event.inputs.skip_recent }}
           SITCA_START: ${{ github.event.inputs.start_date }}
           SITCA_TIME_BUDGET: ${{ github.event.inputs.time_budget }}
         run: python build_sitca.py
