@@ -1,0 +1,60 @@
+name: 建置 境外基金 雙源淨值庫
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: '資料源：both(雙源容錯) / yfinance / moneydj'
+        required: true
+        default: 'both'
+      codes:
+        description: '要抓的代碼(逗號分隔)。留空=用內建測試清單(5檔知名境外基金)'
+        required: false
+        default: ''
+      years:
+        description: '抓幾年歷史(yfinance適用)'
+        required: true
+        default: '15'
+      time_budget:
+        description: '本次最多跑幾分鐘(上限360，建議300留緩衝)'
+        required: true
+        default: '300'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: 取出 repo
+        uses: actions/checkout@v4
+
+      - name: 安裝 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安裝相依
+        run: pip install requests yfinance
+
+      - name: 執行境外建庫
+        env:
+          OFFSHORE_SOURCE: ${{ github.event.inputs.source }}
+          OFFSHORE_CODES: ${{ github.event.inputs.codes }}
+          OFFSHORE_YEARS: ${{ github.event.inputs.years }}
+          TIME_BUDGET_MIN: ${{ github.event.inputs.time_budget }}
+        run: python build_offshore.py
+
+      - name: 提交結果回 repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --staged --quiet; then
+            echo "無新資料"
+          else
+            git commit -m "境外建庫: 雙源淨值增量 ($(date +%Y-%m-%d_%H:%M))"
+            git push
+          fi
