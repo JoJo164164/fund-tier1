@@ -41,6 +41,7 @@ jobs:
 
       - name: 執行境外建庫
         env:
+          PYTHONUNBUFFERED: '1'   # 即時輸出log，不緩衝
           OFFSHORE_SOURCE: ${{ github.event.inputs.source }}
           OFFSHORE_CODES: ${{ github.event.inputs.codes }}
           OFFSHORE_YEARS: ${{ github.event.inputs.years }}
@@ -55,6 +56,10 @@ jobs:
           if git diff --staged --quiet; then
             echo "無新資料"
           else
-            git commit -m "境外建庫: 雙源淨值增量 ($(date +%Y-%m-%d_%H:%M))"
-            git push
+            git commit -m "境外建庫: 三源淨值增量 ($(date +%Y-%m-%d_%H:%M))"
+            # 防衝突：另一個workflow可能同時commit，先rebase再push，最多試5次
+            for i in 1 2 3 4 5; do
+              git pull --rebase origin main && git push && break
+              echo "push衝突，第 $i 次重試…"; sleep $((RANDOM % 10 + 5))
+            done
           fi
