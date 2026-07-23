@@ -20,6 +20,18 @@ on:
         description: '起始日 YYYYMMDD(留空=從今天往回跳skip_recent天)。續抓更早歷史往前調'
         required: false
         default: ''
+      filter_companies:
+        description: '【篩選】只存哪些投信(逗號分隔代碼,如 A0036,A0032)。留空=全部'
+        required: false
+        default: ''
+      filter_assets:
+        description: '【篩選】只存哪些資產類型：股票型,債券型,平衡型,ETF,主動式ETF,貨幣市場,指數型,組合型,不動產證券化,ETF連結基金。留空=全部'
+        required: false
+        default: ''
+      filter_regions:
+        description: '【篩選】只存哪些投資區域：台灣,中國,美國,日本,印度,越南,韓國,亞洲,歐洲,拉丁美洲,新興市場,全球。留空=全部'
+        required: false
+        default: ''
       time_budget:
         description: '本次最多跑幾分鐘(上限360,建議300留緩衝)'
         required: true
@@ -52,6 +64,9 @@ jobs:
           SITCA_SKIP_RECENT: ${{ github.event.inputs.skip_recent }}
           SITCA_START: ${{ github.event.inputs.start_date }}
           SITCA_TIME_BUDGET: ${{ github.event.inputs.time_budget }}
+          FILTER_COMPANIES: ${{ github.event.inputs.filter_companies }}
+          FILTER_ASSETS: ${{ github.event.inputs.filter_assets }}
+          FILTER_REGIONS: ${{ github.event.inputs.filter_regions }}
         run: python build_sitca.py
 
       - name: 提交結果回 repo
