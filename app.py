@@ -18,6 +18,7 @@
 """
 
 import io
+import os
 import re
 import time
 import datetime as dt
@@ -321,43 +322,89 @@ def fetch_sitca_nav(company: str, date_str: str) -> Tuple[List[dict], str]:
 #   資料來源：data/sitca_nav.csv(境內) + data/offshore_nav.csv(境外)
 #   每檔標記境內/境外、投信/發行商，供篩選維度用（憲法：分類篩選後掃描）
 # ══════════════════════════════════════════════════════════════
-HIST_SITCA = "data/sitca_nav.csv"
+HIST_SITCA_GLOB = "data/sitca_nav_*.csv"   # 分年拆檔（避開GitHub 100MB限制）
+HIST_SITCA_LEGACY = "data/sitca_nav.csv"   # 舊版單檔（向後相容）
 HIST_OFFSHORE = "data/offshore_nav.csv"
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def load_history_db() -> Tuple[pd.DataFrame, str]:
-    """讀取歷史庫 CSV（境內+境外合併）。
+def load_history_db(max_years: Optional[int] = None) -> Tuple[pd.DataFrame, str]:
+    """讀取歷史庫（境內分年檔 + 境外）。
 
-    回傳：(DataFrame[代碼,日期,淨值,名稱,境內外,發行],  來源說明)
-    找不到檔案時回空表（不報錯，讓 UI 提示去建庫）。
+    分年拆檔：data/sitca_nav_2011.csv ... sitca_nav_2026.csv，用 glob 合併。
+    向後相容舊的單檔 sitca_nav.csv。
+
+    ★ max_years：只讀最近N年（避免記憶體爆掉）。
+      實測風險：4246檔×5年≈530萬筆≈850MB，Streamlit Cloud免費版約1GB → 會崩。
+      掃描「今日觸發」只需最近資料；完整歷史勝率再開大。None=全讀。
+    回傳：(DataFrame[代碼,日期,淨值,名稱,境內外,發行,資產類型,投資區域], 來源說明)
     """
-    frames = []
-    src_msg = []
-    for path, region, issuer_col in [
-        (HIST_SITCA, "境內", "投信"),
-        (HIST_OFFSHORE, "境外", "來源"),
-    ]:
+    import glob
+    frames, src_msg = [], []
+
+    # ── 境內：分年檔 + 舊單檔 ──
+    sitca_files = sorted(glob.glob(HIST_SITCA_GLOB))
+    if max_years:
+        # 分年檔名帶年份，只留最近N年（檔名如 sitca_nav_2024.csv）
+        cur_y = dt.date.today().year
+        keep = set(str(y) for y in range(cur_y - max_years + 1, cur_y + 1))
+        sitca_files = [f for f in sitca_files
+                       if any(y in os.path.basename(f) for y in keep)]
+    if os.path.exists(HIST_SITCA_LEGACY):
+        sitca_files.append(HIST_SITCA_LEGACY)
+    n_sitca = 0
+    for path in sitca_files:
         try:
-            df = pd.read_csv(path, dtype=str)
+            # 省記憶體：只讀必要欄位（不讀類型代碼/幣別/分類等用不到的）
+            want = ["代碼", "日期", "淨值", "名稱", "投信", "資產類型", "投資區域"]
+            head = pd.read_csv(path, nrows=0)
+            use = [c for c in want if c in head.columns]
+            df = pd.read_csv(path, dtype=str, usecols=use)
             if len(df) == 0:
                 continue
             df["淨值"] = pd.to_numeric(df["淨值"], errors="coerce")
             df = df.dropna(subset=["淨值"])
-            df["境內外"] = region
-            df["發行"] = df[issuer_col] if issuer_col in df.columns else ""
-            keep = ["代碼", "日期", "淨值", "名稱", "境內外", "發行"]
-            frames.append(df[[c for c in keep if c in df.columns]])
-            src_msg.append("{}({}筆)".format(path.split("/")[-1], len(df)))
-        except FileNotFoundError:
+            df["境內外"] = "境內"
+            df["發行"] = df["投信"] if "投信" in df.columns else ""
+            for c in ["資產類型", "投資區域"]:
+                if c not in df.columns:
+                    df[c] = "未分類"
+            df = df[["代碼", "日期", "淨值", "名稱", "境內外", "發行",
+                     "資產類型", "投資區域"]]
+            # 重複性高的欄位轉 category，記憶體可省 5-10 倍
+            for c in ["名稱", "境內外", "發行", "資產類型", "投資區域"]:
+                df[c] = df[c].astype("category")
+            frames.append(df)
+            n_sitca += len(df)
+        except Exception:
             continue
-        except Exception as e:
-            src_msg.append("{}讀取失敗:{}".format(path, type(e).__name__))
+    if n_sitca:
+        src_msg.append("境內{}年檔({:,}筆)".format(len(sitca_files), n_sitca))
+
+    # ── 境外 ──
+    try:
+        df = pd.read_csv(HIST_OFFSHORE, dtype=str)
+        if len(df) > 0:
+            df["淨值"] = pd.to_numeric(df["淨值"], errors="coerce")
+            df = df.dropna(subset=["淨值"])
+            df["境內外"] = "境外"
+            df["發行"] = df["來源"] if "來源" in df.columns else ""
+            for c in ["資產類型", "投資區域"]:
+                if c not in df.columns:
+                    df[c] = "未分類"
+            frames.append(df[["代碼", "日期", "淨值", "名稱", "境內外", "發行",
+                              "資產類型", "投資區域"]])
+            src_msg.append("境外({:,}筆)".format(len(df)))
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
     if not frames:
-        return pd.DataFrame(columns=["代碼", "日期", "淨值", "名稱", "境內外", "發行"]), \
+        return pd.DataFrame(columns=["代碼", "日期", "淨值", "名稱", "境內外", "發行",
+                                     "資產類型", "投資區域"]), \
             "尚無歷史庫（請先用 GitHub Actions 建庫）"
-    out = pd.concat(frames, ignore_index=True)
-    return out, " + ".join(src_msg)
+    return pd.concat(frames, ignore_index=True), " + ".join(src_msg)
 
 
 def hist_to_prices(df_one: pd.DataFrame) -> Dict[str, float]:
@@ -798,7 +845,14 @@ def main():
     # ══ Tab0：☀️ 每早掃描（C層 — 每天第一個看的畫面）══
     with tabs[0]:
         st.subheader("☀️ 每早掃描 — 今天誰觸發 + 歷史勝率")
-        hist, hsrc = load_history_db()
+        depth_opt = st.radio(
+            "歷史深度（資料量大，先用小範圍確保不當機）",
+            ["最近2年（推薦，快）", "最近3年", "最近5年", "全部"],
+            horizontal=True, index=0,
+            help="4246檔×5年≈530萬筆≈850MB，Streamlit免費版約1GB記憶體。"
+                 "掃描今日觸發用2年就夠；要完整歷史勝率再開大。")
+        _depth = {"最近2年（推薦，快）": 2, "最近3年": 3, "最近5年": 5, "全部": None}[depth_opt]
+        hist, hsrc = load_history_db(_depth)
         if len(hist) == 0:
             st.info("**尚無歷史庫。** 這頁需要先用 GitHub Actions 建歷史庫"
                     "（data/sitca_nav.csv、data/offshore_nav.csv）。"
@@ -806,22 +860,30 @@ def main():
             st.caption("目前狀態：{}".format(hsrc))
         else:
             st.caption("歷史庫：{}".format(hsrc))
-            # 篩選維度（憲法：分類篩選後掃描，先上境內外+發行公司）
-            fc1, fc2, fc3 = st.columns(3)
+            # 篩選維度（憲法：分類篩選後掃描）— 4維度：境內外/公司/資產類型/投資區域
+            fc1, fc2 = st.columns(2)
             regions = ["全部"] + sorted(hist["境內外"].dropna().unique().tolist())
             pick_region = fc1.selectbox("境內/境外", regions)
-            issuers = hist["發行"].dropna()
-            if pick_region != "全部":
-                issuers = hist[hist["境內外"] == pick_region]["發行"].dropna()
-            issuer_opts = ["全部"] + sorted([i for i in issuers.unique() if i])
+            _iss = hist if pick_region == "全部" else hist[hist["境內外"] == pick_region]
+            issuer_opts = ["全部"] + sorted([i for i in _iss["發行"].dropna().unique() if i])
             pick_issuer = fc2.selectbox("發行公司/投信", issuer_opts)
-            scan_thr = fc3.number_input("觸發門檻(%)", value=-10.0, step=0.5, max_value=0.0)
+
+            fc3, fc4, fc5 = st.columns(3)
+            asset_opts = ["全部"] + sorted([a for a in hist["資產類型"].dropna().unique() if a])
+            pick_asset = fc3.selectbox("資產類型", asset_opts)
+            area_opts = ["全部"] + sorted([r for r in hist["投資區域"].dropna().unique() if r])
+            pick_area = fc4.selectbox("投資區域", area_opts)
+            scan_thr = fc5.number_input("觸發門檻(%)", value=-10.0, step=0.5, max_value=0.0)
 
             view = hist.copy()
             if pick_region != "全部":
                 view = view[view["境內外"] == pick_region]
             if pick_issuer != "全部":
                 view = view[view["發行"] == pick_issuer]
+            if pick_asset != "全部":
+                view = view[view["資產類型"] == pick_asset]
+            if pick_area != "全部":
+                view = view[view["投資區域"] == pick_area]
 
             n_funds = view["代碼"].nunique()
             st.caption("篩選後範圍：{} 檔基金（縮小範圍可加快掃描）".format(n_funds))
