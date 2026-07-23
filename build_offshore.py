@@ -68,9 +68,127 @@ SEED_FUNDS = [
     {"yf": "",           "mdj": "FLZ14", "name": "富蘭克林坦伯頓外國基金A"},
 ]
 
+# ── Yahoo 奇摩基金（境外主源：SSR、有「最長」歷史、ID為Morningstar SecId）──
+# 實測：tw.stock.yahoo.com/fund/{ID}/history 為SSR，表格直接在HTML；
+#       頁面有「1個月/3個月/6個月/1年/3年/5年/最長」+「下載歷史報價(日期區間)」
+YH_HIST_URL = "https://tw.stock.yahoo.com/fund/{fid}/history"
+YH_LIST_URL = "https://tw.stock.yahoo.com/fund/offshore/"
+YH_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+# 期間參數候選（實跑時自動試，取回傳最多者；不猜死一種）
+YH_PERIOD_PARAMS = [
+    "?period=max", "?range=max", "?period=10y", "?range=10y",
+    "?period=5y", "?range=5y", "",
+]
+
+# 歷史列格式：2026/07/21 → 22.69（SSR純文字）
+_YH_ROW_RE = re.compile(r'(\d{4}/\d{2}/\d{2})\s+([\d,]+\.\d+)')
+
+
+def fetch_yahoo_fund(fid, years=15):
+    """抓 Yahoo 奇摩基金歷史淨值。自動嘗試多種期間參數，取回傳最多的那組。
+
+    fid 格式：F00000Q03Y:FO（Morningstar SecId + :FO境外）
+    回傳 (list[(date,nav)], 幣別, 錯誤)
+    """
+    best, best_param = [], None
+    for p in YH_PERIOD_PARAMS:
+        try:
+            r = requests.get(YH_HIST_URL.format(fid=fid) + p,
+                             headers=YH_HEADERS, timeout=25)
+            if r.status_code != 200:
+                continue
+            rows = _YH_ROW_RE.findall(r.text)
+            out = []
+            for ds, nav in rows:
+                try:
+                    y, m, d = ds.split("/")
+                    out.append(("{}-{}-{}".format(y, m, d), float(nav.replace(",", ""))))
+                except Exception:
+                    continue
+            # 去重（同頁可能重複出現）
+            out = sorted(set(out))
+            if len(out) > len(best):
+                best, best_param = out, p
+            # 已拿到夠長歷史就不用再試
+            if len(best) > 250 * min(years, 3):
+                break
+            time.sleep(0.2)
+        except Exception:
+            continue
+    if not best:
+        return [], "", "yahoo無資料"
+    return best, "", None if best_param is None else None
+
+
+def fetch_yahoo_offshore_list(max_pages=40):
+    """抓 Yahoo 奇摩「境外基金」清單，取得 F0000xxx:FO 這類 ID。"""
+    found = {}
+    id_re = re.compile(r'/fund/(F[A-Z0-9]{9}:FO)')
+    for page in range(max_pages):
+        url = YH_LIST_URL if page == 0 else "{}?page={}".format(YH_LIST_URL, page + 1)
+        try:
+            r = requests.get(url, headers=YH_HEADERS, timeout=25)
+            if r.status_code != 200:
+                break
+            ids = id_re.findall(r.text)
+            if not ids:
+                break
+            new = 0
+            for i in ids:
+                if i not in found:
+                    found[i] = i
+                    new += 1
+            print("  Yahoo清單頁 {} → 新增 {}（累計 {}）".format(page + 1, new, len(found)))
+            if new == 0:
+                break
+            time.sleep(0.3)
+        except Exception:
+            break
+    return list(found.keys())
+
+
 # ── MoneyDJ 抓取（Big5、傳統server頁，已實測可抓30日淨值）──
 MDJ_NAV_URL = "https://www.moneydj.com/funddj/ya/yp010001.djhtm?a={code}"
+MDJ_LIST_URL = "https://www.moneydj.com/funddj/ya/yp081001.djhtm"
 MDJ_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+# 清單頁每檔連結格式：yp010001.djhtm?a={代碼}（實測含 NBTG1/ALZM9/SHZ19/FTZF9…）
+_MDJ_CODE_RE = re.compile(r'yp010001\.djhtm\?a=([A-Za-z0-9]+)')
+
+
+def fetch_moneydj_list(max_pages=30):
+    """抓 MoneyDJ 境外基金全清單（分頁）。
+
+    實測（憲法v4）：yp081001.djhtm 為傳統server頁、Big5、不擋爬蟲，
+    一頁約百檔，涵蓋全總代理（路博邁/聯博/施羅德/富坦/安聯/摩根/貝萊德/高盛…）。
+    分頁參數 ?a=N。回傳 [(代碼, 名稱), ...] 去重後清單。
+    """
+    found = {}
+    for page in range(max_pages):
+        url = MDJ_LIST_URL if page == 0 else "{}?a={}".format(MDJ_LIST_URL, page)
+        try:
+            r = requests.get(url, headers=MDJ_HEADERS, timeout=25)
+            r.encoding = "big5"
+            html = r.text
+        except Exception as e:
+            print("  清單頁 {} 失敗: {}".format(page, type(e).__name__))
+            continue
+        codes = _MDJ_CODE_RE.findall(html)
+        if not codes:
+            break  # 無更多資料
+        new = 0
+        for c in codes:
+            if c not in found:
+                # 嘗試從連結附近取中文名
+                m = re.search(r'\[([^\]]{2,60})\]\(https://[^)]*yp010001\.djhtm\?a=' + c + r'\)', html)
+                found[c] = m.group(1) if m else c
+                new += 1
+        print("  清單頁 {} → 新增 {} 檔（累計 {}）".format(page, new, len(found)))
+        if new == 0 and page > 0:
+            break
+        time.sleep(0.3)
+    return [(k, v) for k, v in found.items()]
 
 
 def fetch_moneydj(code):
@@ -163,30 +281,41 @@ def append_coverage(row):
 
 
 def build_one(fund):
-    """對單檔基金執行雙源容錯抓取。回傳 (nav_records, coverage_row)。"""
+    """對單檔基金執行三源容錯抓取（Yahoo奇摩 → yfinance → MoneyDJ）。
+
+    優先序理由（憲法v4實測）：
+      ① Yahoo奇摩基金：SSR、有「最長」歷史、ID即Morningstar SecId → 回測需要的長歷史
+      ② yfinance 0P代碼：同源Yahoo，覆蓋率待實測
+      ③ MoneyDJ：只有30天，當最後補網
+    """
     name = fund["name"]
-    key = fund.get("yf") or fund.get("mdj")
     series, cur, src, err = [], "", "", ""
 
-    # ① 優先 yfinance
-    if SOURCE in ("yfinance", "both") and fund.get("yf"):
+    # ① Yahoo 奇摩基金（境外長歷史主源）
+    if SOURCE in ("yahoo", "both") and fund.get("yh"):
+        series, cur, err = fetch_yahoo_fund(fund["yh"], YEARS)
+        if series:
+            src = "yahoo"
+
+    # ② yfinance
+    if not series and SOURCE in ("yfinance", "both") and fund.get("yf"):
         series, cur, err = fetch_yfinance(fund["yf"], YEARS)
         if series:
             src = "yfinance"
 
-    # ② fallback MoneyDJ
+    # ③ MoneyDJ（30天，補網）
     if not series and SOURCE in ("moneydj", "both") and fund.get("mdj"):
         series, cur, err2 = fetch_moneydj(fund["mdj"])
         if series:
             src = "moneydj"
         else:
-            err = "yf:{} | mdj:{}".format(err, err2)
+            err = "yh/yf:{} | mdj:{}".format(err, err2)
 
-    code_id = fund.get("yf") or fund.get("mdj")
+    code_id = fund.get("yh") or fund.get("yf") or fund.get("mdj")
     if not series:
         return [], {"代碼": code_id, "名稱": name, "來源": "無",
                     "資料起": "", "資料截至": "", "年數": 0, "筆數": 0,
-                    "狀態": "✗ 兩源皆失敗: {}".format(err)}
+                    "狀態": "✗ 三源皆失敗: {}".format(err)}
 
     dates = [d for d, _ in series]
     yrs = round((dt.date.fromisoformat(max(dates)) - dt.date.fromisoformat(min(dates))).days / 365.25, 1)
@@ -200,9 +329,21 @@ def build_one(fund):
 
 def main():
     codes_env = os.environ.get("OFFSHORE_CODES", "").strip()
-    if codes_env:
-        funds = [{"yf": c if c.startswith("0P") else "",
-                  "mdj": c if not c.startswith("0P") else "",
+    if codes_env.upper() == "ALL":
+        # ★ 全市場：優先用 Yahoo 奇摩清單（該源有長歷史），MoneyDJ 當補充
+        print("【全市場模式】抓取境外基金清單…")
+        yh_ids = fetch_yahoo_offshore_list()
+        funds = [{"yh": i, "yf": "", "mdj": "", "name": i} for i in yh_ids]
+        print("Yahoo清單：{} 檔".format(len(yh_ids)))
+        if len(yh_ids) < 50:  # Yahoo清單抓太少 → 補 MoneyDJ
+            print("Yahoo清單偏少，補抓 MoneyDJ 清單…")
+            for c, n in fetch_moneydj_list():
+                funds.append({"yh": "", "yf": "", "mdj": c, "name": n})
+        print("清單合計：{} 檔\n".format(len(funds)))
+    elif codes_env:
+        funds = [{"yh": c if c.endswith(":FO") else "",
+                  "yf": c if c.startswith("0P") else "",
+                  "mdj": c if (not c.startswith("0P") and not c.endswith(":FO")) else "",
                   "name": c} for c in codes_env.split(",")]
     else:
         funds = SEED_FUNDS
