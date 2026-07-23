@@ -1,82 +1,128 @@
 name: 建置 SITCA 基金淨值歷史庫
 
-# 讓使用者可在 GitHub 網頁 Actions 分頁手動按「Run workflow」觸發
 on:
   workflow_dispatch:
     inputs:
       companies:
-        description: '★填 ALL =一次查所有公司(最快,請求數1/36)★ ｜留空=逐家抓36家 ｜填代碼=只抓指定家'
-        required: false
+        description: '★ALL=一次查所有公司(4400檔/次) ｜留空=逐家36家 ｜填代碼如A0036,A0032(資料量小更快)'
+        required: true
         default: 'ALL'
       days_back:
-        description: '往回抓幾個營業日。驗證用 5；建1年約250；建15年填 3800'
+        description: '往回抓幾個營業日。測試5；1年250；5年1250；15年3800'
         required: true
         default: '250'
+      parallel:
+        description: '★平行分段數(1-20)★ 20=同時跑20個job,總時間÷20。15年建議20'
+        required: true
+        default: '10'
       skip_recent:
-        description: '跳過最近幾個營業日(避開境外淨值未齊,隔天4點後才齊)。預設2'
+        description: '跳過最近幾個營業日(避開境外淨值未齊)。預設2'
         required: true
         default: '2'
       start_date:
-        description: '起始日 YYYYMMDD(留空=從今天往回跳skip_recent天)。續抓更早歷史往前調'
+        description: '起始日 YYYYMMDD(留空=從今天往回跳skip_recent天)'
         required: false
         default: ''
       filter_companies:
-        description: '【篩選】只存哪些投信(逗號分隔代碼,如 A0036,A0032)。留空=全部'
+        description: '【篩選】只存哪些投信(如 A0036,A0032)。留空=全部'
         required: false
         default: ''
       filter_assets:
-        description: '【篩選】只存哪些資產類型：股票型,債券型,平衡型,ETF,主動式ETF,貨幣市場,指數型,組合型,不動產證券化,ETF連結基金。留空=全部'
+        description: '【篩選】只存哪些資產類型：股票型,債券型,平衡型,ETF,主動式ETF,貨幣市場,指數型,組合型。留空=全部'
         required: false
         default: ''
       filter_regions:
-        description: '【篩選】只存哪些投資區域：台灣,中國,美國,日本,印度,越南,韓國,亞洲,歐洲,拉丁美洲,新興市場,全球。留空=全部'
+        description: '【篩選】只存哪些區域：台灣,中國,美國,日本,印度,越南,亞洲,歐洲,新興市場,全球。留空=全部'
         required: false
         default: ''
-      time_budget:
-        description: '本次最多跑幾分鐘(上限360,建議300留緩衝)'
+      sleep_sec:
+        description: '每請求間隔秒(0.3較快,太小可能被擋)'
         required: true
-        default: '300'
+        default: '0.3'
 
-# 讓 workflow 能把抓到的 CSV commit 回 repo
 permissions:
   contents: write
 
 jobs:
-  build:
+  # 依 parallel 參數動態產生分段清單
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 350   # 低於 GitHub 硬上限 360，留緩衝
+    outputs:
+      segments: ${{ steps.gen.outputs.segments }}
     steps:
-      - name: 取出 repo
-        uses: actions/checkout@v4
+      - id: gen
+        run: |
+          N=${{ github.event.inputs.parallel }}
+          SEGS=$(python3 -c "print([i for i in range($N)])")
+          echo "segments=$SEGS" >> $GITHUB_OUTPUT
+          echo "將平行跑 $N 段"
 
-      - name: 安裝 Python
-        uses: actions/setup-python@v5
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        segment: ${{ fromJson(needs.prepare.outputs.segments) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: 安裝相依
-        run: pip install requests
+      - run: pip install requests
 
-      - name: 執行建庫腳本
+      - name: 執行建庫(第${{ matrix.segment }}段)
         env:
           SITCA_COMPANIES: ${{ github.event.inputs.companies }}
           SITCA_DAYS_BACK: ${{ github.event.inputs.days_back }}
           SITCA_SKIP_RECENT: ${{ github.event.inputs.skip_recent }}
           SITCA_START: ${{ github.event.inputs.start_date }}
-          SITCA_TIME_BUDGET: ${{ github.event.inputs.time_budget }}
+          SITCA_SLEEP: ${{ github.event.inputs.sleep_sec }}
+          SITCA_TIME_BUDGET: '300'
           FILTER_COMPANIES: ${{ github.event.inputs.filter_companies }}
           FILTER_ASSETS: ${{ github.event.inputs.filter_assets }}
           FILTER_REGIONS: ${{ github.event.inputs.filter_regions }}
+          SEGMENT_TOTAL: ${{ github.event.inputs.parallel }}
+          SEGMENT_INDEX: ${{ matrix.segment }}
         run: python build_sitca.py
 
-      - name: 提交結果回 repo
+      - name: 上傳本段結果
+        uses: actions/upload-artifact@v4
+        with:
+          name: seg-${{ matrix.segment }}
+          path: data/
+          retention-days: 1
+
+  # 所有分段跑完後，合併結果並commit
+  merge:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: _segs
+      - name: 合併分段檔案
+        run: |
+          mkdir -p data
+          cp -rn _segs/*/* data/ 2>/dev/null || true
+          echo "合併後 data/ 內容："
+          ls -lh data/
+          echo "總筆數："
+          cat data/sitca_nav*.csv 2>/dev/null | grep -c "" || echo 0
+      - name: 提交回 repo
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/
           if git diff --staged --quiet; then
-            echo "無新資料，略過提交"
+            echo "無新資料"
           else
-            git commit -m "建庫: SITCA 淨值增量 ($(date +%Y-%m-%d_%H:%M))"
+            git commit -m "建庫: SITCA 平行分段合併 ($(date +%Y-%m-%d_%H:%M))"
             git push
           fi
