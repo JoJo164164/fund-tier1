@@ -40,12 +40,21 @@ HEADERS = {
     "Referer": URL,
     "Origin": "https://www.sitca.org.tw",
 }
-SLEEP = float(os.environ.get("SITCA_SLEEP", "1.0"))            # 每請求間隔秒
+SLEEP = float(os.environ.get("SITCA_SLEEP", "0.3"))  # 降至0.3秒(原1.0)加速            # 每請求間隔秒
 TIME_BUDGET_MIN = int(os.environ.get("SITCA_TIME_BUDGET", "300"))
 DAYS_BACK = int(os.environ.get("SITCA_DAYS_BACK", "250"))  # 預設約1年；15年填3800
 
+# ★ 平行化分段（GitHub Actions matrix）：把日期切成 N 段同時跑，總時間 ÷ N
+#   SEGMENT_TOTAL=20 + SEGMENT_INDEX=0..19 → 20個job平行，29小時→1.5小時
+#   每段寫自己的CSV（避免多job寫同檔衝突），app讀取時自動合併所有分段檔
+SEGMENT_TOTAL = int(os.environ.get("SEGMENT_TOTAL", "1"))
+SEGMENT_INDEX = int(os.environ.get("SEGMENT_INDEX", "0"))
+
 DATA_DIR = "data"
-PROGRESS_PATH = os.path.join(DATA_DIR, "sitca_progress.json")
+# 分段檔名：多job平行時各寫各的，避免衝突；SEGMENT_TOTAL=1時維持原檔名
+_seg_suffix = "" if SEGMENT_TOTAL <= 1 else "_seg{:02d}".format(SEGMENT_INDEX)
+CSV_PATH = os.path.join(DATA_DIR, "sitca_nav{}.csv".format(_seg_suffix))
+PROGRESS_PATH = os.path.join(DATA_DIR, "sitca_progress{}.json".format(_seg_suffix))
 CSV_COLS = ["代碼", "日期", "淨值", "幣別", "名稱", "投信代碼", "投信",
             "類型代號", "資產類型", "投資區域", "分類"]
 
@@ -196,29 +205,35 @@ def _detect_fields(html):
     return date_name, company_name
 
 
-def fetch_one(session, company, date_str):
-    """抓某投信某日全部基金淨值。回傳 (list[dict], 錯誤或None)。
+def fetch_one(session, company, date_str, cached=None):
+    """抓某投信某日全部基金淨值。回傳 (list[dict], 錯誤或None, 新cached)。
+
+    ★ 效能優化：重用 VIEWSTATE
+      ASP.NET 的 POST 回應本身也帶新的 __VIEWSTATE/__EVENTVALIDATION，
+      可直接拿來下一次用 → 省掉每次的 GET，請求數減半、時間減半。
+      cached=(vs, vsg, ev, date_name, company_name)；首次或失效時才重新 GET。
 
     ★ ALL 模式（company="" 或 "ALL"）：
-      SITCA 公司下拉第一個選項是「所有公司」，value 為空字串（真實VIEWSTATE解碼確認）。
-      若後端支援，一次 POST 即回「全市場某日所有基金」→ 請求數變 1/36，
-      15年建庫從 ~56 小時降到 ~1.5 小時。腳本會自動比對筆數驗證是否真的生效。
+      公司下拉第一個選項「所有公司」value為空字串（真實VIEWSTATE解碼確認）。
+      一次POST回全市場某日所有基金（實測4400檔/36家投信）。
     """
-    r = session.get(URL, headers=HEADERS, timeout=20)
-    if r.status_code != 200:
-        return [], "GET {}".format(r.status_code)
-    html = r.text
-    vs = _hidden(html, "__VIEWSTATE")
-    if not vs:
-        return [], "no VIEWSTATE"
-    date_name, company_name = _detect_fields(html)
+    if cached is None:
+        r = session.get(URL, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return [], "GET {}".format(r.status_code), None
+        html = r.text
+        vs = _hidden(html, "__VIEWSTATE")
+        if not vs:
+            return [], "no VIEWSTATE", None
+        date_name, company_name = _detect_fields(html)
+        cached = (vs, _hidden(html, "__VIEWSTATEGENERATOR"),
+                  _hidden(html, "__EVENTVALIDATION"), date_name, company_name)
+
+    vs, vsg, ev, date_name, company_name = cached
     comp_value = "" if str(company).upper() in ("", "ALL") else company
     payload = {
-        "__VIEWSTATE": vs,
-        "__VIEWSTATEGENERATOR": _hidden(html, "__VIEWSTATEGENERATOR"),
-        "__EVENTVALIDATION": _hidden(html, "__EVENTVALIDATION"),
-        date_name: date_str,
-        company_name: comp_value,
+        "__VIEWSTATE": vs, "__VIEWSTATEGENERATOR": vsg, "__EVENTVALIDATION": ev,
+        date_name: date_str, company_name: comp_value,
     }
     for btn in ["ctl00$ContentPlaceHolder1$btnQuery",
                 "ctl00$ContentPlaceHolder1$BtnQuery",
@@ -226,8 +241,17 @@ def fetch_one(session, company, date_str):
         payload.setdefault(btn, "查詢")
     r2 = session.post(URL, headers=HEADERS, data=payload, timeout=60)
     if r2.status_code != 200:
-        return [], "POST {}".format(r2.status_code)
-    return parse_rows(r2.text), None
+        return [], "POST {}".format(r2.status_code), None  # token可能失效→下次重取
+
+    rows = parse_rows(r2.text)
+    # 從POST回應提取新token供下次使用（省掉GET）
+    new_vs = _hidden(r2.text, "__VIEWSTATE")
+    if new_vs:
+        cached = (new_vs, _hidden(r2.text, "__VIEWSTATEGENERATOR"),
+                  _hidden(r2.text, "__EVENTVALIDATION"), date_name, company_name)
+    elif not rows:
+        cached = None  # 解析不到且無token→下次重新GET
+    return rows, None, cached
 
 
 def load_progress():
@@ -299,6 +323,15 @@ def main():
                 skipped += 1
     days = business_days(start, DAYS_BACK)
 
+    # ★ 平行化：只跑本 segment 負責的日期（用 index 間隔切，讓各段負載均勻）
+    if SEGMENT_TOTAL > 1:
+        days = [d for i, d in enumerate(days) if i % SEGMENT_TOTAL == SEGMENT_INDEX]
+        print("【平行分段】第 {}/{} 段，本段負責 {} 天".format(
+            SEGMENT_INDEX + 1, SEGMENT_TOTAL, len(days)))
+    if not days:
+        print("本段無日期可抓，結束。")
+        return
+
     print("=" * 60)
     print("SITCA 建庫  投信:", len(companies), "家 | 日數:", len(days),
           "| 跳最近:", skip_recent, "營業日")
@@ -309,6 +342,7 @@ def main():
     print("已完成(斷點續傳):", len(done), "個(公司,日)組合")
 
     session = requests.Session()
+    tok_cache = None  # VIEWSTATE快取，重用以省掉每次的GET
     t0 = time.time()
     new_records = 0
     tasks_done = 0
@@ -327,9 +361,10 @@ def main():
                 _summary(new_records, tasks_done, done)
                 return
 
-            rows, err = fetch_one(session, company, date_str)
+            rows, err, tok_cache = fetch_one(session, company, date_str, tok_cache)
             if err:
                 print("  ✗ {} {} → {}".format(cname, date_str, err))
+                tok_cache = None  # 失敗時清快取，下次重新GET
                 time.sleep(SLEEP)
                 continue
 
