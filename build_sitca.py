@@ -40,7 +40,13 @@ HEADERS = {
     "Referer": URL,
     "Origin": "https://www.sitca.org.tw",
 }
-SLEEP = float(os.environ.get("SITCA_SLEEP", "0.3"))  # 降至0.3秒(原1.0)加速            # 每請求間隔秒
+SLEEP = float(os.environ.get("SITCA_SLEEP", "1.0"))  # 單job基準間隔
+
+# ★ 自動保護：多job平行時，總請求頻率 = 並行數 ÷ SLEEP。
+#   若不補償，8段×0.3秒 = 26次/秒 → 遠超SITCA承受度，會被限流(實測失敗)。
+#   故實際延遲 = 基準 × 並行數，讓「總頻率」維持在基準值，不論分幾段。
+_SEG_N = int(os.environ.get("SEGMENT_TOTAL", "1"))
+EFFECTIVE_SLEEP = SLEEP * max(_SEG_N, 1)
 TIME_BUDGET_MIN = int(os.environ.get("SITCA_TIME_BUDGET", "300"))
 DAYS_BACK = int(os.environ.get("SITCA_DAYS_BACK", "250"))  # 預設約1年；15年填3800
 
@@ -244,13 +250,13 @@ def fetch_one(session, company, date_str, cached=None):
         return [], "POST {}".format(r2.status_code), None  # token可能失效→下次重取
 
     rows = parse_rows(r2.text)
-    # 從POST回應提取新token供下次使用（省掉GET）
-    new_vs = _hidden(r2.text, "__VIEWSTATE")
-    if new_vs:
-        cached = (new_vs, _hidden(r2.text, "__VIEWSTATEGENERATOR"),
-                  _hidden(r2.text, "__EVENTVALIDATION"), date_name, company_name)
-    elif not rows:
-        cached = None  # 解析不到且無token→下次重新GET
+    # ★ 關鍵修正：**不**從 POST 回應更新 token。
+    #   ASP.NET 的 VIEWSTATE 會把查詢結果序列化進去 → 3292筆資料會讓它膨脹到數MB，
+    #   下次 POST 帶著它送出就會 write timeout（實測 log 證實）。
+    #   改為持續重用「第一次 GET 拿到的乾淨小 token」，payload 恆定小。
+    if not rows:
+        # 解析不到 → 可能 token 過期，清快取讓下次重新 GET
+        return rows, None, None
     return rows, None, cached
 
 
@@ -361,11 +367,24 @@ def main():
                 _summary(new_records, tasks_done, done)
                 return
 
-            rows, err, tok_cache = fetch_one(session, company, date_str, tok_cache)
-            if err:
-                print("  ✗ {} {} → {}".format(cname, date_str, err))
-                tok_cache = None  # 失敗時清快取，下次重新GET
-                time.sleep(SLEEP)
+            # 重試機制：網路抖動/逾時不該讓整個 job 崩潰（實測教訓）
+            rows, err, tok_cache = None, None, tok_cache
+            for attempt in range(3):
+                try:
+                    rows, err, tok_cache = fetch_one(session, company, date_str, tok_cache)
+                    break
+                except Exception as e:
+                    err = "{}: {}".format(type(e).__name__, str(e)[:60])
+                    tok_cache = None  # 清快取重新取乾淨token
+                    if attempt < 2:
+                        print("    ⟳ 重試 {}/3（{}）".format(attempt + 1, err))
+                        time.sleep(EFFECTIVE_SLEEP * 2)
+                    else:
+                        rows = []
+            if err or not rows:
+                print("  ✗ {} {} → {}".format(cname, date_str, err or "無資料"))
+                tok_cache = None
+                time.sleep(EFFECTIVE_SLEEP)
                 continue
 
             recs = []
@@ -407,7 +426,7 @@ def main():
             print("  ✓ {} {} → {} 檔（{}家投信, 主動ETF {}）".format(
                 cname, date_str, len(recs), n_comp, n_active))
             save_progress(done)  # 每筆都存，確保任何中斷都可續傳
-            time.sleep(SLEEP)
+            time.sleep(EFFECTIVE_SLEEP)
 
     _summary(new_records, tasks_done, done)
 
