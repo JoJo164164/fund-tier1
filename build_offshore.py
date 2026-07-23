@@ -122,29 +122,35 @@ def fetch_yahoo_fund(fid, years=15):
 
 
 def fetch_yahoo_offshore_list(max_pages=40):
-    """抓 Yahoo 奇摩「境外基金」清單，取得 F0000xxx:FO 這類 ID。"""
+    """抓 Yahoo 奇摩境外基金清單。
+
+    ★ 修正（實測）：原用 /fund/offshore/ 抓到 0 檔（該路徑非清單頁）。
+      正確入口為績效排行頁：/fund/offshore/ranking?range={1wk|3mo|1yr|3yr}
+      每個維度百大，4維度聯集可涵蓋數百檔（有重疊，自動去重）。
+    """
     found = {}
-    id_re = re.compile(r'/fund/(F[A-Z0-9]{9}:FO)')
-    for page in range(max_pages):
-        url = YH_LIST_URL if page == 0 else "{}?page={}".format(YH_LIST_URL, page + 1)
-        try:
-            r = requests.get(url, headers=YH_HEADERS, timeout=25)
-            if r.status_code != 200:
-                break
-            ids = id_re.findall(r.text)
-            if not ids:
-                break
-            new = 0
-            for i in ids:
-                if i not in found:
-                    found[i] = i
-                    new += 1
-            print("  Yahoo清單頁 {} → 新增 {}（累計 {}）".format(page + 1, new, len(found)))
-            if new == 0:
-                break
-            time.sleep(0.3)
-        except Exception:
-            break
+    id_re = re.compile(r'/fund/([A-Z0-9]{8,12}:FO)')
+    bases = [
+        "https://tw.stock.yahoo.com/fund/offshore/ranking?range={}",
+        "https://tw.finance.yahoo.com/fund/offshore/ranking?range={}",
+    ]
+    for rng in ["1wk", "1mo", "3mo", "1yr", "3yr", "5yr"]:
+        got = 0
+        for base in bases:
+            try:
+                r = requests.get(base.format(rng), headers=YH_HEADERS, timeout=25)
+                if r.status_code != 200:
+                    continue
+                for i in id_re.findall(r.text):
+                    if i not in found:
+                        found[i] = i
+                        got += 1
+                if got:
+                    break  # 這個維度已拿到，換下一個維度
+            except Exception:
+                continue
+        print("  Yahoo排行[{}] → 新增 {}（累計 {}）".format(rng, got, len(found)))
+        time.sleep(0.3)
     return list(found.keys())
 
 
@@ -158,36 +164,43 @@ _MDJ_CODE_RE = re.compile(r'yp010001\.djhtm\?a=([A-Za-z0-9]+)')
 
 
 def fetch_moneydj_list(max_pages=30):
-    """抓 MoneyDJ 境外基金全清單（分頁）。
+    """抓 MoneyDJ 境外基金全清單。
 
-    實測（憲法v4）：yp081001.djhtm 為傳統server頁、Big5、不擋爬蟲，
-    一頁約百檔，涵蓋全總代理（路博邁/聯博/施羅德/富坦/安聯/摩根/貝萊德/高盛…）。
-    分頁參數 ?a=N。回傳 [(代碼, 名稱), ...] 去重後清單。
+    ★ 修正（實測）：`?a=` 是**公司代碼**不是頁碼（原以為分頁 → 只抓到首頁100檔）。
+      改為：先從首頁抓所有公司連結，再逐家抓該公司的基金列表。
     """
     found = {}
-    for page in range(max_pages):
-        url = MDJ_LIST_URL if page == 0 else "{}?a={}".format(MDJ_LIST_URL, page)
+    # ① 先抓首頁（預設列出部分基金 + 公司連結）
+    try:
+        r = requests.get(MDJ_LIST_URL, headers=MDJ_HEADERS, timeout=25)
+        r.encoding = "big5"
+        html = r.text
+        for c in _MDJ_CODE_RE.findall(html):
+            found.setdefault(c, c)
+        # 公司代碼：yp081001.djhtm?a=XXX 這類連結
+        comp_re = re.compile(r'yp081001\.djhtm\?a=([A-Za-z0-9]+)')
+        comps = sorted(set(comp_re.findall(html)))
+        print("  MoneyDJ 首頁 → {} 檔基金、{} 家公司".format(len(found), len(comps)))
+    except Exception as e:
+        print("  MoneyDJ 首頁失敗:", type(e).__name__)
+        return [(k, v) for k, v in found.items()]
+
+    # ② 逐家公司抓其基金列表
+    for i, comp in enumerate(comps[:max_pages]):
         try:
-            r = requests.get(url, headers=MDJ_HEADERS, timeout=25)
+            r = requests.get("{}?a={}".format(MDJ_LIST_URL, comp),
+                             headers=MDJ_HEADERS, timeout=25)
             r.encoding = "big5"
-            html = r.text
-        except Exception as e:
-            print("  清單頁 {} 失敗: {}".format(page, type(e).__name__))
+            new = 0
+            for c in _MDJ_CODE_RE.findall(r.text):
+                if c not in found:
+                    found[c] = c
+                    new += 1
+            if new:
+                print("  MoneyDJ 公司[{}] → 新增 {}（累計 {}）".format(comp, new, len(found)))
+            time.sleep(0.3)
+        except Exception:
             continue
-        codes = _MDJ_CODE_RE.findall(html)
-        if not codes:
-            break  # 無更多資料
-        new = 0
-        for c in codes:
-            if c not in found:
-                # 嘗試從連結附近取中文名
-                m = re.search(r'\[([^\]]{2,60})\]\(https://[^)]*yp010001\.djhtm\?a=' + c + r'\)', html)
-                found[c] = m.group(1) if m else c
-                new += 1
-        print("  清單頁 {} → 新增 {} 檔（累計 {}）".format(page, new, len(found)))
-        if new == 0 and page > 0:
-            break
-        time.sleep(0.3)
     return [(k, v) for k, v in found.items()]
 
 
@@ -373,7 +386,7 @@ def main():
         append_coverage(cov)
         done.add(code_id)
         save_progress(done)
-        print("  {} {} → {} [{}] {}筆 {}年".format(
+        print("  {} {} → [{}] {}筆 {}年".format(
             cov["狀態"][:1], fund["name"][:24], cov["來源"],
             cov["筆數"], cov["年數"]))
         time.sleep(SLEEP)
