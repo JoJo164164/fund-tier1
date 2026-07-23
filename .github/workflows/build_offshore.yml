@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       source:
-        description: '資料源：both(雙源容錯) / yfinance / moneydj'
+        description: '資料源：both(三源容錯:Yahoo→yfinance→MoneyDJ) / yahoo / yfinance / moneydj'
         required: true
         default: 'both'
       codes:
-        description: '要抓的代碼(逗號分隔)。留空=用內建測試清單(5檔知名境外基金)'
+        description: '★填 ALL =自動抓全市場境外基金清單★ ｜留空=5檔測試 ｜或填代碼'
         required: false
-        default: ''
+        default: 'ALL'
       years:
         description: '抓幾年歷史(yfinance適用)'
         required: true
