@@ -42,7 +42,7 @@ HEADERS = {
 }
 SLEEP = float(os.environ.get("SITCA_SLEEP", "1.0"))            # 每請求間隔秒
 TIME_BUDGET_MIN = int(os.environ.get("SITCA_TIME_BUDGET", "300"))
-DAYS_BACK = int(os.environ.get("SITCA_DAYS_BACK", "5"))
+DAYS_BACK = int(os.environ.get("SITCA_DAYS_BACK", "250"))  # 預設約1年；15年填3800
 
 DATA_DIR = "data"
 CSV_PATH = os.path.join(DATA_DIR, "sitca_nav.csv")
@@ -84,7 +84,8 @@ def parse_rows(html):
         comp, code, fname, cur, nav = tds[1], tds[3], tds[5], tds[6], tds[7]
         if not re.match(r'^A00\d{2}$', comp):
             continue
-        out.append({"代碼": code, "名稱": fname, "幣別": cur, "淨值": nav})
+        out.append({"代碼": code, "名稱": fname, "幣別": cur, "淨值": nav,
+                    "公司代碼": comp})
     return out
 
 
@@ -109,7 +110,13 @@ def _detect_fields(html):
 
 
 def fetch_one(session, company, date_str):
-    """抓某投信某日全部基金淨值。回傳 (list[dict], 錯誤或None)。"""
+    """抓某投信某日全部基金淨值。回傳 (list[dict], 錯誤或None)。
+
+    ★ ALL 模式（company="" 或 "ALL"）：
+      SITCA 公司下拉第一個選項是「所有公司」，value 為空字串（真實VIEWSTATE解碼確認）。
+      若後端支援，一次 POST 即回「全市場某日所有基金」→ 請求數變 1/36，
+      15年建庫從 ~56 小時降到 ~1.5 小時。腳本會自動比對筆數驗證是否真的生效。
+    """
     r = session.get(URL, headers=HEADERS, timeout=20)
     if r.status_code != 200:
         return [], "GET {}".format(r.status_code)
@@ -118,18 +125,19 @@ def fetch_one(session, company, date_str):
     if not vs:
         return [], "no VIEWSTATE"
     date_name, company_name = _detect_fields(html)
+    comp_value = "" if str(company).upper() in ("", "ALL") else company
     payload = {
         "__VIEWSTATE": vs,
         "__VIEWSTATEGENERATOR": _hidden(html, "__VIEWSTATEGENERATOR"),
         "__EVENTVALIDATION": _hidden(html, "__EVENTVALIDATION"),
         date_name: date_str,
-        company_name: company,
+        company_name: comp_value,
     }
     for btn in ["ctl00$ContentPlaceHolder1$btnQuery",
                 "ctl00$ContentPlaceHolder1$BtnQuery",
                 "ctl00$ContentPlaceHolder1$Button1"]:
         payload.setdefault(btn, "查詢")
-    r2 = session.post(URL, headers=HEADERS, data=payload, timeout=30)
+    r2 = session.post(URL, headers=HEADERS, data=payload, timeout=60)
     if r2.status_code != 200:
         return [], "POST {}".format(r2.status_code)
     return parse_rows(r2.text), None
@@ -172,16 +180,37 @@ def business_days(start, days_back):
 
 
 def main():
-    companies_env = os.environ.get("SITCA_COMPANIES", "A0036,A0032")
-    companies = [c.strip() for c in companies_env.split(",") if c.strip()]
+    # 留空 = 自動抓全部 36 家投信（正式建庫）；填代碼 = 只抓指定家（驗證用）
+    # 填 "ALL" = 一次查「所有公司」（若SITCA支援，請求數變1/36）
+    companies_env = os.environ.get("SITCA_COMPANIES", "").strip()
+    all_mode = companies_env.upper() == "ALL"
+    if all_mode:
+        companies = ["ALL"]
+    elif companies_env:
+        companies = [c.strip() for c in companies_env.split(",") if c.strip()]
+    else:
+        companies = list(COMPANIES.keys())  # 全 36 家逐一抓
+
+    # 跳過最近 N 個營業日：境外基金淨值有時差（隔天下午4點後才齊，使用者提供）
+    # 不猜「殘缺」、不丟資料，只是不抓「太新、境外還沒補齊」的日期。預設跳2天緩衝。
+    skip_recent = int(os.environ.get("SITCA_SKIP_RECENT", "2"))
 
     start_env = os.environ.get("SITCA_START", "").strip()
-    start = (dt.datetime.strptime(start_env, "%Y%m%d").date()
-             if start_env else dt.date.today() - dt.timedelta(days=1))
+    if start_env:
+        start = dt.datetime.strptime(start_env, "%Y%m%d").date()
+    else:
+        # 從「今天往回跳 skip_recent 個營業日」當起點，避開境外未齊的最新日
+        start = dt.date.today()
+        skipped = 0
+        while skipped < skip_recent:
+            start -= dt.timedelta(days=1)
+            if start.weekday() < 5:
+                skipped += 1
     days = business_days(start, DAYS_BACK)
 
     print("=" * 60)
-    print("SITCA 建庫  投信:", companies, "| 日數:", len(days))
+    print("SITCA 建庫  投信:", len(companies), "家 | 日數:", len(days),
+          "| 跳最近:", skip_recent, "營業日")
     print("區間:", days[0], "~", days[-1], "| 時間預算:", TIME_BUDGET_MIN, "分")
     print("=" * 60)
 
@@ -194,7 +223,7 @@ def main():
     tasks_done = 0
 
     for company in companies:
-        cname = COMPANIES.get(company, company)
+        cname = "所有公司" if company == "ALL" else COMPANIES.get(company, company)
         for d in days:
             date_str = d.strftime("%Y%m%d")
             key = (company, date_str)
@@ -215,14 +244,16 @@ def main():
 
             recs = []
             for x in rows:
+                # ALL 模式下 company="ALL"，真實投信要取自資料列本身的公司代碼
+                c_code = x.get("公司代碼") or company
                 recs.append({
                     "代碼": x["代碼"],
                     "日期": d.isoformat(),
                     "淨值": x["淨值"],
                     "幣別": x["幣別"],
                     "名稱": x["名稱"][:40],
-                    "投信代碼": company,
-                    "投信": cname,
+                    "投信代碼": c_code,
+                    "投信": COMPANIES.get(c_code, c_code),
                     "分類": classify_etf(x["代碼"]),
                 })
             append_csv(recs)
@@ -230,7 +261,9 @@ def main():
             new_records += len(recs)
             tasks_done += 1
             n_active = sum(1 for r in recs if r["分類"].startswith("主動ETF"))
-            print("  ✓ {} {} → {} 檔（主動ETF {}）".format(cname, date_str, len(recs), n_active))
+            n_comp = len(set(r["投信代碼"] for r in recs))
+            print("  ✓ {} {} → {} 檔（{}家投信, 主動ETF {}）".format(
+                cname, date_str, len(recs), n_comp, n_active))
             save_progress(done)  # 每筆都存，確保任何中斷都可續傳
             time.sleep(SLEEP)
 
