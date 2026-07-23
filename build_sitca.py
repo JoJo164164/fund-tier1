@@ -45,9 +45,27 @@ TIME_BUDGET_MIN = int(os.environ.get("SITCA_TIME_BUDGET", "300"))
 DAYS_BACK = int(os.environ.get("SITCA_DAYS_BACK", "250"))  # 預設約1年；15年填3800
 
 DATA_DIR = "data"
-CSV_PATH = os.path.join(DATA_DIR, "sitca_nav.csv")
 PROGRESS_PATH = os.path.join(DATA_DIR, "sitca_progress.json")
-CSV_COLS = ["代碼", "日期", "淨值", "幣別", "名稱", "投信代碼", "投信", "分類"]
+CSV_COLS = ["代碼", "日期", "淨值", "幣別", "名稱", "投信代碼", "投信",
+            "類型代號", "資產類型", "投資區域", "分類"]
+
+# ── 篩選參數（縮小存檔範圍；抓取成本不變，但檔案小、app跑得快）──
+# SITCA 一次請求回全市場，抓取時間與檔數無關；篩選是為了「存得下、跑得動」
+FILTER_COMPANIES = [c.strip() for c in
+                    os.environ.get("FILTER_COMPANIES", "").split(",") if c.strip()]
+FILTER_ASSETS = [a.strip() for a in
+                 os.environ.get("FILTER_ASSETS", "").split(",") if a.strip()]
+FILTER_REGIONS = [r.strip() for r in
+                  os.environ.get("FILTER_REGIONS", "").split(",") if r.strip()]
+
+
+def csv_path_for(date_obj):
+    """★分年拆檔★：每年一個CSV，避開 GitHub 單檔 100MB 限制。
+
+    全市場一天約4400筆，一年約110萬筆≈80-100MB → 剛好一年一檔最適當。
+    app 讀取時用 glob 合併所有年度檔。
+    """
+    return os.path.join(DATA_DIR, "sitca_nav_{}.csv".format(date_obj.year))
 
 COMPANIES = {
     "A0001": "兆豐投信", "A0003": "第一金投信", "A0004": "滙豐投信", "A0005": "元大投信",
@@ -72,7 +90,11 @@ def classify_etf(code):
 
 
 def parse_rows(html):
-    """兩段式解析（已用三張真實DOM圖驗證：不受單雙引號/class/長名稱影響）。"""
+    """兩段式解析（已用三張真實DOM圖驗證：不受單雙引號/class/長名稱影響）。
+
+    保留「類型代號」欄（tds[0]，如 AA1/AG/AH21/AL21）——這是 SITCA 官方分類鑰匙，
+    存原始值不丟；官方「基金類型代號說明」對照表取得後可隨時精準翻譯，無需重抓。
+    """
     out = []
     for tr in re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.S):
         if 'DTHeader' in tr or '類型代號' in tr:
@@ -81,12 +103,77 @@ def parse_rows(html):
         tds = [re.sub(r'<[^>]+>', '', t).strip() for t in tds]
         if len(tds) < 8:
             continue
-        comp, code, fname, cur, nav = tds[1], tds[3], tds[5], tds[6], tds[7]
+        tcode, comp, code, fname, cur, nav = tds[0], tds[1], tds[3], tds[5], tds[6], tds[7]
         if not re.match(r'^A00\d{2}$', comp):
             continue
         out.append({"代碼": code, "名稱": fname, "幣別": cur, "淨值": nav,
-                    "公司代碼": comp})
+                    "公司代碼": comp, "類型代號": tcode})
     return out
+
+
+
+
+# ══════════════════════════════════════════════════════════════
+# 分類推斷（篩選維度用）
+#   ⚠️ 標明為「推斷值」：官方「基金類型代號說明」對照表尚未取得（鐵律5）。
+#      原始「類型代號」已存入CSV，取得官方對照後可精準重標，無需重抓資料。
+# ══════════════════════════════════════════════════════════════
+# 類型代號前綴 → 資產類型（自實際資料反推，待官方對照表確認）
+TYPE_PREFIX = [
+    ("AL", "主動式ETF"),      # AL21: 元大全球AI新經濟主動式ETF
+    ("AK", "ETF連結基金"),    # AK2: 元大標普500ETF連結基金
+    ("AH", "ETF"),            # AH11/AH21/AH22: 0050/0056/債券ETF
+    ("AG", "不動產證券化"),   # AG: 全球不動產證券化基金
+    ("AD", "貨幣市場"),       # AD1/AD2: 得寶貨幣市場、萬泰貨幣市場
+    ("AC", "債券型"),         # AC21: 0至2年投資級企業債
+    ("AB", "平衡型"),         # AB2: 新東協平衡
+    ("AE", "組合型"),         # AE21/AE23: 全球新興市場精選組合、ETF穩健組合
+    ("AI", "指數型"),         # AI2: 大中華價值指數、印尼指數
+    ("AA", "股票型"),         # AA1/AA2: 元大2001、多福、全球農業商機
+]
+
+# 名稱關鍵字 → 投資區域（雙軌推斷，名稱比代號更能反映投資區域）
+REGION_KEYWORDS = [
+    ("台灣", ["台灣", "臺灣", "台股", "上市", "上櫃", "店頭", "中型100", "50", "高股息"]),
+    ("中國", ["中國", "大陸", "A股", "滬深", "上證", "中華", "人民幣"]),
+    ("美國", ["美國", "美股", "標普", "S&P", "納斯達克", "道瓊", "費城", "美元"]),
+    ("日本", ["日本", "日經", "東證"]),
+    ("印度", ["印度"]),
+    ("越南", ["越南"]),
+    ("韓國", ["韓國", "南韓"]),
+    ("亞洲", ["亞洲", "亞太", "東協", "新興亞洲", "泰國", "印尼", "菲律賓", "馬來"]),
+    ("歐洲", ["歐洲", "德國", "法國", "英國", "歐元"]),
+    ("拉丁美洲", ["巴西", "拉丁", "墨西哥"]),
+    ("新興市場", ["新興"]),
+    ("全球", ["全球", "環球", "世界", "國際"]),
+]
+
+
+def classify_asset(type_code, name=""):
+    """資產類型推斷：類型代號前綴優先，無法判斷時用名稱關鍵字。"""
+    tc = str(type_code).strip().upper()
+    for prefix, label in TYPE_PREFIX:
+        if tc.startswith(prefix):
+            return label
+    n = str(name)
+    if any(k in n for k in ["貨幣市場"]):
+        return "貨幣市場"
+    if any(k in n for k in ["債", "bond"]):
+        return "債券型"
+    if "平衡" in n or "多重資產" in n:
+        return "平衡型"
+    if "ETF" in n:
+        return "ETF"
+    return "其他"
+
+
+def classify_region(name):
+    """投資區域推斷：依名稱關鍵字（順序重要，特定區域優先於「全球」）。"""
+    n = str(name)
+    for region, kws in REGION_KEYWORDS:
+        if any(k in n for k in kws):
+            return region
+    return "未分類"
 
 
 def _hidden(html, name):
@@ -157,10 +244,14 @@ def save_progress(done):
         json.dump(sorted(done), f, ensure_ascii=False)
 
 
-def append_csv(records):
+def append_csv(records, date_obj):
+    """依日期寫入對應年度的CSV（分年拆檔）。"""
+    if not records:
+        return
     os.makedirs(DATA_DIR, exist_ok=True)
-    exists = os.path.exists(CSV_PATH)
-    with open(CSV_PATH, "a", encoding="utf-8-sig", newline="") as f:
+    path = csv_path_for(date_obj)
+    exists = os.path.exists(path)
+    with open(path, "a", encoding="utf-8-sig", newline="") as f:
         w = csv.DictWriter(f, fieldnames=CSV_COLS)
         if not exists:
             w.writeheader()
@@ -246,17 +337,33 @@ def main():
             for x in rows:
                 # ALL 模式下 company="ALL"，真實投信要取自資料列本身的公司代碼
                 c_code = x.get("公司代碼") or company
+                tcode = x.get("類型代號", "")
+                fname = x["名稱"]
+                asset = classify_asset(tcode, fname)
+                region = classify_region(fname)
+
+                # ── 套用篩選（縮小存檔範圍，抓取成本不變）──
+                if FILTER_COMPANIES and c_code not in FILTER_COMPANIES:
+                    continue
+                if FILTER_ASSETS and asset not in FILTER_ASSETS:
+                    continue
+                if FILTER_REGIONS and region not in FILTER_REGIONS:
+                    continue
+
                 recs.append({
                     "代碼": x["代碼"],
                     "日期": d.isoformat(),
                     "淨值": x["淨值"],
                     "幣別": x["幣別"],
-                    "名稱": x["名稱"][:40],
+                    "名稱": fname[:40],
                     "投信代碼": c_code,
                     "投信": COMPANIES.get(c_code, c_code),
+                    "類型代號": tcode,
+                    "資產類型": asset,
+                    "投資區域": region,
                     "分類": classify_etf(x["代碼"]),
                 })
-            append_csv(recs)
+            append_csv(recs, d)
             done.add(key)
             new_records += len(recs)
             tasks_done += 1
@@ -274,10 +381,28 @@ def _summary(new_records, tasks_done, done):
     print("=" * 60)
     print("本次完成 {} 個(公司,日)，新增 {} 筆淨值記錄".format(tasks_done, new_records))
     print("累計進度:", len(done), "個組合")
-    if os.path.exists(CSV_PATH):
-        with open(CSV_PATH, encoding="utf-8-sig") as f:
-            total = sum(1 for _ in f) - 1
-        print("CSV 總記錄數:", total)
+    import glob
+    files = sorted(glob.glob(os.path.join(DATA_DIR, "sitca_nav_*.csv")))
+    if files:
+        print("── 年度檔（分年拆檔避開100MB限制）──")
+        grand = 0
+        for p in files:
+            with open(p, encoding="utf-8-sig") as f:
+                n = sum(1 for _ in f) - 1
+            mb = os.path.getsize(p) / 1024 / 1024
+            grand += n
+            flag = " ⚠️接近100MB" if mb > 80 else ""
+            print("  {}: {:,} 筆, {:.1f} MB{}".format(
+                os.path.basename(p), n, mb, flag))
+        print("  總計: {:,} 筆".format(grand))
+    if FILTER_COMPANIES or FILTER_ASSETS or FILTER_REGIONS:
+        print("── 本次篩選條件 ──")
+        if FILTER_COMPANIES:
+            print("  投信:", FILTER_COMPANIES)
+        if FILTER_ASSETS:
+            print("  資產類型:", FILTER_ASSETS)
+        if FILTER_REGIONS:
+            print("  投資區域:", FILTER_REGIONS)
     print("=" * 60)
 
 
