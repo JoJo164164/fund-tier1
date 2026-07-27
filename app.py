@@ -929,7 +929,7 @@ def main():
                 if len(result) == 0:
                     st.warning("無足夠歷史資料可掃描。")
                 else:
-                    n_trig = int((result["觸發"] == "🔴").sum())
+                    n_trig = int(result["今日觸發"].astype(str).str.contains("是").sum())
                     a, b, c = st.columns(3)
                     a.metric("掃描檔數", len(result))
                     b.metric("🔴 今日觸發", n_trig)
