@@ -261,11 +261,36 @@ def fetch_one(session, company, date_str, cached=None):
 
 
 def load_progress():
-    try:
-        with open(PROGRESS_PATH, encoding="utf-8") as f:
-            return set(tuple(x) for x in json.load(f))
-    except Exception:
-        return set()
+    """取得已完成的 (公司,日期)。
+
+    ★ 修正（實測血淚）：原本只讀 progress.json，但它會與實際CSV不同步——
+      失敗的run已把日期記進progress、資料卻沒進CSV → 後續run跳過該日 → 歷史庫到處是洞
+      → 實測後果：10筆淨值橫跨348天（應為14天），100%資料被鐵律16判為無效。
+      改為：**以CSV實際內容為準**反推已完成日期，progress.json僅作輔助。
+    """
+    done = set()
+    # ① 從所有已存在的 CSV 反推真實已完成的日期（跨分段/分年檔）
+    import glob
+    for path in glob.glob(os.path.join(DATA_DIR, "sitca_nav*.csv")):
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                header = f.readline().strip().split(",")
+                if "日期" not in header:
+                    continue
+                di = header.index("日期")
+                ci = header.index("投信代碼") if "投信代碼" in header else None
+                seen_dates = set()
+                for line in f:
+                    parts = line.rstrip("\n").split(",")
+                    if len(parts) > di:
+                        seen_dates.add(parts[di])
+                # ALL模式一次抓全市場 → 該日有資料即視為完成
+                for d in seen_dates:
+                    if d and len(d) == 10:
+                        done.add(("ALL", d.replace("-", "")))
+        except Exception:
+            continue
+    return done
 
 
 def save_progress(done):
