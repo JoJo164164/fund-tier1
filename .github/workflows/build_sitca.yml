@@ -77,6 +77,7 @@ jobs:
 
       - name: 執行建庫(第${{ matrix.segment }}段)
         env:
+          PYTHONUNBUFFERED: '1'   # 即時輸出log，不緩衝
           SITCA_COMPANIES: ${{ github.event.inputs.companies }}
           SITCA_DAYS_BACK: ${{ github.event.inputs.days_back }}
           SITCA_SKIP_RECENT: ${{ github.event.inputs.skip_recent }}
@@ -88,7 +89,7 @@ jobs:
           FILTER_REGIONS: ${{ github.event.inputs.filter_regions }}
           SEGMENT_TOTAL: ${{ github.event.inputs.parallel }}
           SEGMENT_INDEX: ${{ matrix.segment }}
-        run: python build_sitca.py
+        run: python -u build_sitca.py
 
       - name: 上傳本段結果
         uses: actions/upload-artifact@v4
@@ -124,5 +125,9 @@ jobs:
             echo "無新資料"
           else
             git commit -m "建庫: SITCA 平行分段合併 ($(date +%Y-%m-%d_%H:%M))"
-            git push
+            # 防衝突：另一個workflow可能同時commit，先rebase再push，最多試5次
+            for i in 1 2 3 4 5; do
+              git pull --rebase origin main && git push && break
+              echo "push衝突，第 $i 次重試…"; sleep $((RANDOM % 10 + 5))
+            done
           fi
