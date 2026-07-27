@@ -852,6 +852,17 @@ def run_system_checks(adjust_on: bool, fee_b: float, fee_s: float, lag: int) -> 
 def main():
     st.set_page_config(page_title="台灣基金滾動跌幅系統", layout="wide",
                        initial_sidebar_state="collapsed")
+    # 全寬版面：移除預設窄邊距與 iframe 感（使用者明確要求，勿用側欄/窄框）
+    st.markdown("""
+        <style>
+        .block-container {padding-top: 1.5rem; padding-left: 3rem;
+                          padding-right: 3rem; max-width: 100%;}
+        [data-testid="stDataFrame"] {width: 100% !important;}
+        [data-testid="stElementToolbar"] {display: none;}
+        .stTabs [data-baseweb="tab-list"] {gap: 8px;}
+        .stTabs [data-baseweb="tab"] {height: 44px; font-size: 15px;}
+        </style>
+    """, unsafe_allow_html=True)
     st.title("📉 台灣基金滾動跌幅系統")
 
     # 進階參數收在 expander，不佔主畫面（原本放側欄很不直覺）
