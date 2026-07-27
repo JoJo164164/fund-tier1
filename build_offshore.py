@@ -122,35 +122,93 @@ def fetch_yahoo_fund(fid, years=15):
 
 
 def fetch_yahoo_offshore_list(max_pages=40):
-    """抓 Yahoo 奇摩境外基金清單。
+    """抓 Yahoo 全市場基金清單。
 
-    ★ 修正（實測）：原用 /fund/offshore/ 抓到 0 檔（該路徑非清單頁）。
-      正確入口為績效排行頁：/fund/offshore/ranking?range={1wk|3mo|1yr|3yr}
-      每個維度百大，4維度聯集可涵蓋數百檔（有重疊，自動去重）。
+    ★ 設計原則：**不猜參數，讓程式自己試出哪組有效**（沙盒無法驗證URL參數，
+      因為 web_fetch 會跟隨 canonical 把 query string 丟掉）。
+
+    已知事實（實測）：
+      - /fund/search  是基金篩選頁，預設條件「三個月5%以上」→ 238筆，SSR
+      - /fund/offshore 是境外基金**搜尋**頁，無關鍵字時回「沒有符合 "" 的搜尋結果」
+      - 每檔連結格式 /fund/{SecId}:FO/summary；:FO 是所有基金的後綴，**不分境內外**
+
+    策略：
+      ① 先用少量探針關鍵字 × 多組參數名，偵測哪組真的會改變結果
+      ② 偵測到有效組合 → 全關鍵字窮舉
+      ③ 都無效 → 至少收下預設清單（並在 log 明講，讓使用者知道覆蓋率有限）
     """
     found = {}
     id_re = re.compile(r'/fund/([A-Z0-9]{8,12}:FO)')
-    bases = [
-        "https://tw.stock.yahoo.com/fund/offshore/ranking?range={}",
-        "https://tw.finance.yahoo.com/fund/offshore/ranking?range={}",
-    ]
-    for rng in ["1wk", "1mo", "3mo", "1yr", "3yr", "5yr"]:
-        got = 0
-        for base in bases:
-            try:
-                r = requests.get(base.format(rng), headers=YH_HEADERS, timeout=25)
-                if r.status_code != 200:
-                    continue
-                for i in id_re.findall(r.text):
-                    if i not in found:
-                        found[i] = i
-                        got += 1
-                if got:
-                    break  # 這個維度已拿到，換下一個維度
-            except Exception:
-                continue
-        print("  Yahoo排行[{}] → 新增 {}（累計 {}）".format(rng, got, len(found)))
-        time.sleep(0.3)
+    bases = ["https://tw.stock.yahoo.com/fund/offshore",
+             "https://tw.stock.yahoo.com/fund/search"]
+    param_names = ["keyword", "q", "query", "name", "searchTerm"]
+
+    def _ids(url):
+        try:
+            r = requests.get(url, headers=YH_HEADERS, timeout=25)
+            if r.status_code != 200:
+                return set()
+            return set(id_re.findall(r.text))
+        except Exception:
+            return set()
+
+    # ── ① 偵測有效的 (base, param) 組合 ──
+    probes = ["摩根", "貝萊德", "聯博"]
+    combo = None
+    print("  【偵測有效參數組合】")
+    for base in bases:
+        baseline = _ids(base)          # 不帶參數時的結果
+        for pname in param_names:
+            sets = [_ids("{}?{}={}".format(base, pname, kw)) for kw in probes]
+            # 有效判準：不同關鍵字要回不同結果，且至少一組跟 baseline 不同
+            distinct = len({frozenset(s) for s in sets if s})
+            differs = any(s and s != baseline for s in sets)
+            if distinct >= 2 and differs:
+                combo = (base, pname)
+                print("    ✓ 有效：{}?{}=  (探針回傳 {} 種不同結果)".format(
+                    base.split("/")[-1], pname, distinct))
+                break
+            time.sleep(0.2)
+        if combo:
+            break
+        # 無效也先把 baseline 收下
+        found.update({i: i for i in baseline})
+
+    # ── ② 有效 → 全窮舉；無效 → 只能用預設清單 ──
+    if combo:
+        base, pname = combo
+        keywords = [
+            "摩根", "貝萊德", "富達", "聯博", "施羅德", "安聯", "富蘭克林", "景順",
+            "百達", "瑞銀", "法巴", "駿利", "高盛", "荷寶", "安本", "先機", "利安",
+            "晉達", "天達", "霸菱", "鋒裕", "路博邁", "宏利", "瀚亞", "野村", "柏瑞",
+            "東方匯理", "德意志", "品浩", "美盛", "PIMCO", "NN", "AXA", "保德信",
+            "元大", "國泰", "群益", "統一", "復華", "富邦", "永豐", "台新", "中國信託",
+            "第一金", "兆豐", "華南永昌", "玉山", "凱基", "日盛", "合庫", "聯邦",
+            "滙豐", "匯豐", "台中銀", "大華銀", "街口", "德銀遠東", "康和", "宏遠",
+            "中國", "美國", "日本", "印度", "歐洲", "全球", "環球", "亞洲", "新興",
+            "台灣", "越南", "韓國", "拉丁", "科技", "醫療", "生技", "能源", "金融",
+            "房地產", "基建", "資源", "黃金", "高收益", "投資級", "政府債", "公司債",
+            "平衡", "多重資產", "收益", "成長", "價值", "貨幣", "組合", "永續",
+            "股票", "債券", "A股", "亞太", "東協", "北美", "德國", "英國",
+        ]
+        print("  【全市場窮舉】{} 組關鍵字 × 分頁".format(len(keywords)))
+        for kw in keywords:
+            got = 0
+            for page in range(1, 11):
+                url = "{}?{}={}&page={}".format(base, pname, kw, page)
+                new = _ids(url) - set(found)
+                if not new:
+                    break
+                found.update({i: i for i in new})
+                got += len(new)
+                time.sleep(0.2)
+            if got:
+                print("    [{}] +{} → 累計 {}".format(kw, got, len(found)))
+    else:
+        print("  ⚠️ 所有參數組合皆無效（Yahoo 可能改為純前端篩選）")
+        print("     → 僅能取得預設清單 {} 檔，將由 MoneyDJ 清單補足".format(len(found)))
+
+    print("  Yahoo 清單合計：{} 檔".format(len(found)))
     return list(found.keys())
 
 
