@@ -46,7 +46,7 @@ jobs:
           OFFSHORE_CODES: ${{ github.event.inputs.codes }}
           OFFSHORE_YEARS: ${{ github.event.inputs.years }}
           TIME_BUDGET_MIN: ${{ github.event.inputs.time_budget }}
-        run: python build_offshore.py
+        run: python -u build_offshore.py
 
       - name: 提交結果回 repo
         run: |
