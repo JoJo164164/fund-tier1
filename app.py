@@ -436,11 +436,20 @@ def scan_history_db(df: pd.DataFrame, threshold: float,
         issuer = g["發行"].iloc[0] if "發行" in g.columns else ""
         triggered = last["return"] <= threshold and last["valid"]
 
+        # 連續觸發天數：從最新往回數，連續有幾筆達門檻（使用者要求）
+        consec = 0
+        for r in reversed(rolling):
+            if r["return"] <= threshold and r.get("valid", True):
+                consec += 1
+            else:
+                break
+
         # 歷史勝率（觸發後的最佳持有天數勝率）
-        best_wr, best_h = None, None
+        best_wr, best_h, n_hist = None, None, 0
         if triggered:
             bt = run_full_backtest(prices, threshold, rolling, 0, 0.0, 0.0, max_span)
             if bt:
+                n_hist = bt.get("觸發次數", 0)
                 tbl = build_entry_timing_table(bt)
                 idx = _pick_best_timing_idx(tbl)
                 if idx is not None:
@@ -451,9 +460,11 @@ def scan_history_db(df: pd.DataFrame, threshold: float,
             "代碼": code, "名稱": str(name)[:28], "境內外": region, "發行": issuer,
             "分類": classify_etf(code),
             "滾動10日%": round(last["return"], 2),
-            "觸發": "🔴" if triggered else "",
+            "今日觸發": "🔴 是" if triggered else "—",
+            "連續觸發天": consec,
             "淨值截至": last["date"],
-            "跨度": last["span_days"],
+            "資料品質": "✅ 正常" if last["valid"] else "⚠️ 資料稀疏({}天)".format(last["span_days"]),
+            "歷史觸發次數": n_hist if n_hist else "",
             "歷史最佳勝率": best_wr if best_wr else "",
             "最佳持有天": best_h if best_h else "",
         })
@@ -461,14 +472,60 @@ def scan_history_db(df: pd.DataFrame, threshold: float,
         return pd.DataFrame()
     out = pd.DataFrame(rows)
     # 觸發的排前面，再按滾動跌幅排序
-    out["_t"] = (out["觸發"] == "🔴").astype(int)
-    out = out.sort_values(["_t", "滾動10日%"], ascending=[False, True]).drop(columns="_t")
+    out["_t"] = (out["今日觸發"].astype(str).str.contains("是")).astype(int)
+    out = out.sort_values(["_t", "連續觸發天", "滾動10日%"],
+                          ascending=[False, False, True]).drop(columns="_t")
     return out
 
+def analyze_one_fund(df_one: pd.DataFrame, threshold: float,
+                     max_span: int = MAX_SPAN_DAYS) -> dict:
+    """單檔基金深度分析（使用者要求：像個股版那樣做個別分析）。
 
-# ══════════════════════════════════════════════════════════════
-# 滾動報酬（鐵律16：10筆 + 曆日跨度 + sanity 上限）
-# ══════════════════════════════════════════════════════════════
+    回傳 dict：
+      prices     {日期:淨值}
+      rolling    每日滾動10日報酬（含跨度/有效性）
+      triggers   歷史所有觸發點
+      timing_tbl 各持有天數的勝率表
+      best_idx   最佳持有天數（母專案同源規則）
+      stats      摘要統計
+    """
+    prices = hist_to_prices(df_one)
+    if len(prices) < ROLL_N + 1:
+        return {"error": "資料不足（僅 {} 筆，需 ≥{} 筆）".format(len(prices), ROLL_N + 1)}
+
+    rolling = calc_all_rolling_returns(prices, ROLL_N, max_span)
+    if not rolling:
+        return {"error": "無法計算滾動報酬"}
+
+    valid_roll = [r for r in rolling if r["valid"]]
+    triggers = [r for r in valid_roll if r["return"] <= threshold]
+    bt = run_full_backtest(prices, threshold, rolling, 0, 0.0, 0.0, max_span)
+    tbl = build_entry_timing_table(bt) if bt else pd.DataFrame()
+    best_idx = _pick_best_timing_idx(tbl) if len(tbl) else None
+
+    dates = sorted(prices.keys())
+    rets = [r["return"] for r in valid_roll]
+    return {
+        "prices": prices,
+        "rolling": rolling,
+        "triggers": triggers,
+        "timing_tbl": tbl,
+        "best_idx": best_idx,
+        "bt": bt,
+        "stats": {
+            "資料起": dates[0], "資料迄": dates[-1], "筆數": len(prices),
+            "年數": round((dt.date.fromisoformat(dates[-1])
+                          - dt.date.fromisoformat(dates[0])).days / 365.25, 1),
+            "有效視窗": len(valid_roll), "無效視窗": len(rolling) - len(valid_roll),
+            "歷史觸發次數": len(triggers),
+            "最深跌幅": round(min(rets), 2) if rets else 0,
+            "P5": round(float(np.percentile(rets, 5)), 2) if rets else 0,
+            "P10": round(float(np.percentile(rets, 10)), 2) if rets else 0,
+            "中位數": round(float(np.median(rets)), 2) if rets else 0,
+        },
+    }
+
+
 def calc_all_rolling_returns(prices_dict: Dict[str, float],
                              roll_n: int = ROLL_N,
                              max_span_days: int = MAX_SPAN_DAYS) -> List[dict]:
@@ -793,54 +850,32 @@ def run_system_checks(adjust_on: bool, fee_b: float, fee_s: float, lag: int) -> 
 # UI
 # ══════════════════════════════════════════════════════════════
 def main():
-    st.set_page_config(page_title="基金滾動跌幅系統 Tier1", layout="wide")
-    st.title("📉 台灣基金滾動跌幅系統 — Tier1（被動ETF）v0.1")
-    st.caption("依專案憲法 v2（2026-07-17）｜鐵律12/14/16 已實作｜主動ETF 只收資料不出結論")
+    st.set_page_config(page_title="台灣基金滾動跌幅系統", layout="wide",
+                       initial_sidebar_state="collapsed")
+    st.title("📉 台灣基金滾動跌幅系統")
 
-    # ── 側欄參數 ──
-    with st.sidebar:
-        st.header("⚙️ 參數")
-        st.subheader("觸發")
-        threshold = st.number_input("滾動10日跌幅門檻(%)", value=-10.0, step=0.5, max_value=0.0,
-                                    help="⚠️ 憲法：母專案門檻在台股交易日曆校準，基金版須先跑分布再訂。")
-        max_span = st.number_input("視窗跨度上限(曆日)", value=MAX_SPAN_DAYS, step=1, min_value=14,
-                                   help="鐵律16：10筆跨度超過此值該筆作廢。14天=10交易日+2週末。")
-
-        st.subheader("成本（憲法「十」使用者裁決：預設不計）")
-        entry_lag = st.number_input("entry_lag（觸發後第N筆進場）", value=0, step=1, min_value=0,
-                                    help="裁決：ETF與共同基金均為0。參數保留供日後調整。")
-        fee_buy = st.number_input("申購/買進費(%)", value=0.0, step=0.1, min_value=0.0)
-        fee_sell = st.number_input("贖回/賣出費(%)", value=0.0, step=0.1, min_value=0.0)
-
-        st.subheader("資料")
-        adjust = st.checkbox("配息還原（鐵律14）", value=True,
-                             help="關閉將使除息日被誤判為暴跌信號。高股息ETF尤其嚴重。")
+    # 進階參數收在 expander，不佔主畫面（原本放側欄很不直覺）
+    with st.expander("⚙️ 進階參數（一般使用不需調整）", expanded=False):
+        pc1, pc2, pc3 = st.columns(3)
+        max_span = pc1.number_input(
+            "視窗跨度上限（曆日）", value=MAX_SPAN_DAYS, step=1, min_value=14,
+            help="「往回數10筆淨值」實際橫跨幾天。正常14天(10交易日+2週末)。"
+                 "超過此值代表該基金淨值公告有大缺口，該筆作廢避免假訊號。")
+        entry_lag = pc2.number_input(
+            "entry_lag（觸發後第N筆進場）", value=0, step=1, min_value=0,
+            help="0=假設觸發當日就能買到。基金實務有申購截止時點，此為理論值。")
+        adjust = pc3.checkbox("配息還原", value=True,
+                              help="關閉會讓除息日被誤判成暴跌。高股息標的尤其嚴重。")
+        fc1, fc2 = st.columns(2)
+        fee_buy = fc1.number_input("申購/買進費(%)", value=0.0, step=0.1, min_value=0.0)
+        fee_sell = fc2.number_input("贖回/賣出費(%)", value=0.0, step=0.1, min_value=0.0)
         if not adjust:
-            st.error("🚨 鐵律14：未還原配息，除息日將產生假信號。結果不可信。")
+            st.error("🚨 未還原配息，除息日將產生假信號，結果不可信。")
 
-    if not _HAS_YF:
-        st.error("yfinance 不可用，無法取價。請確認 requirements.txt。")
-        return
+    threshold = -10.0  # 各 tab 內可各自調整
 
-    # ── 標的清單 ──
-    etf_map, src = fetch_etf_list()
-    codes_all = sorted(etf_map.keys())
-    tier1_codes = [c for c in codes_all if is_tier1(c)]
-    active_codes = [c for c in codes_all if not is_tier1(c)]
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("清單總數", len(codes_all))
-    c2.metric("Tier1 被動ETF", len(tier1_codes))
-    c3.metric("Tier4 主動ETF（不出結論）", len(active_codes))
-    st.caption("清單來源：{}".format(src))
-
-    default_sel = [c for c in ["0050.TW", "006208.TW", "00878.TW", "0056.TW"] if c in codes_all]
-    if not default_sel:
-        default_sel = tier1_codes[:4]
-    picks = st.multiselect("選擇標的（僅 Tier1 被動ETF 會產出勝率結論）",
-                           codes_all, default=default_sel)
-
-    tabs = st.tabs(["☀️ 每早掃描", "📊 分布校準", "🎯 觸發掃描", "🔬 回測", "📒 追蹤日誌", "🛡️ 系統檢核", "🔌 SITCA 連線測試"])
+    tabs = st.tabs(["☀️ 每早掃描", "🔍 個別基金分析", "📊 分布校準",
+                    "🔬 ETF回測", "📒 追蹤日誌", "🛡️ 系統檢核", "🔌 SITCA 連線測試"])
 
     # ══ Tab0：☀️ 每早掃描（C層 — 每天第一個看的畫面）══
     with tabs[0]:
@@ -901,7 +936,44 @@ def main():
                     c.metric("觸發門檻", "{}%".format(scan_thr))
                     if n_trig > 0:
                         st.success("**今天有 {} 檔觸發跌幅** — 下方紅點標記，已配對歷史勝率供你判斷。".format(n_trig))
-                    st.dataframe(result, width="stretch")
+                    st.dataframe(
+                        result, width="stretch", height=520,
+                        column_config={
+                            "滾動10日%": st.column_config.NumberColumn(
+                                "滾動10日%", format="%.2f%%",
+                                help="最新淨值 vs 往回第10筆淨值的報酬率。負值=下跌。"),
+                            "今日觸發": st.column_config.TextColumn(
+                                "今日觸發",
+                                help="最新一筆滾動10日跌幅是否達到你設定的門檻。🔴是=今天可考慮進場。"),
+                            "連續觸發天": st.column_config.NumberColumn(
+                                "連續觸發天",
+                                help="從最新往回數，連續有幾筆達門檻。數字大=跌勢持續中，可能還沒落底。"),
+                            "淨值截至": st.column_config.TextColumn(
+                                "淨值截至",
+                                help="這檔基金最新淨值的日期。境外基金有時差，各檔可能不同。"),
+                            "資料品質": st.column_config.TextColumn(
+                                "資料品質",
+                                help="往回10筆淨值實際橫跨幾天。正常14天。橫跨太久代表淨值公告有大缺口，"
+                                     "算出的『10日跌幅』其實是好幾個月的跌幅，不可信，故不採計。"),
+                            "歷史觸發次數": st.column_config.TextColumn(
+                                "歷史觸發次數",
+                                help="這檔基金歷史上總共觸發過幾次此門檻。次數太少(<10)勝率沒有統計意義。"),
+                            "歷史最佳勝率": st.column_config.TextColumn(
+                                "歷史最佳勝率",
+                                help="歷史上觸發後進場，在最佳持有天數下賺錢的比例。"
+                                     "只有樣本≥10才顯示（樣本太少的勝率是雜訊）。"),
+                            "最佳持有天": st.column_config.TextColumn(
+                                "最佳持有天",
+                                help="歷史回測中勝率最高的持有天數。"),
+                        })
+                    # 資料品質警示（使用者反映「很多空白」的根因）
+                    bad = (result["資料品質"].astype(str).str.contains("稀疏")).sum()
+                    if bad:
+                        st.error(
+                            "⚠️ **{} / {} 檔資料品質不佳**（淨值公告有大缺口，"
+                            "往回10筆橫跨遠超過14天）。這些檔的『觸發』與『歷史勝率』會空白，"
+                            "因為系統判定不可信、拒絕產出假訊號。\\n\\n"
+                            "**解法**：歷史庫需要補齊缺漏日期（重跑建庫）。".format(bad, len(result)))
                     st.caption("⚠️ **各檔淨值截至日可能不同**（境外有時差），跨檔比較請看「淨值截至」欄。"
                                "歷史勝率為觸發後最佳持有天數的回測勝率（樣本≥10才顯示，母專案同源）。")
                     st.caption("ℹ️ 進場假設觸發日可成交（entry_lag=0，使用者裁決）；"
@@ -909,89 +981,155 @@ def main():
 
 
     # ══ Tab1：分布校準（憲法：Tier1 第一個產出是分布，不是勝率表）══
-    with tabs[1]:
-        st.subheader("滾動10日報酬分布 — 先看分布，再訂門檻")
-        st.info("**憲法要求**：母專案門檻在台股交易日曆上校準；基金/ETF 非營業日各異、"
-                "視窗跨度浮動，門檻必須先跑分布再訂。**本頁是 Tier1 的第一個產出，不是勝率表。**")
-        if st.button("跑分布", type="primary"):
-            rows, spans = [], []
-            prog = st.progress(0.0)
-            for i, code in enumerate(picks):
-                px, err = fetch_prices(code, adjust)
-                prog.progress((i + 1) / max(len(picks), 1))
-                if err or not px:
-                    st.warning("{}：{}".format(code, err or "無資料"))
-                    continue
-                rr = calc_all_rolling_returns(px, ROLL_N, max_span)
-                if not rr:
-                    continue
-                vals = np.array([r["return"] for r in rr if r["valid"]], dtype=float)
-                sp = np.array([r["span_days"] for r in rr], dtype=float)
-                spans.extend(sp.tolist())
-                if len(vals) == 0:
-                    continue
-                dts = sorted(px.keys())
-                rows.append({
-                    "代碼": code, "分類": classify_etf(code),
-                    "資料起": dts[0], "資料截至": dts[-1], "筆數": len(px),
-                    "年數": round((dt.date.fromisoformat(dts[-1]) - dt.date.fromisoformat(dts[0])).days / 365.25, 1),
-                    "P1": round(float(np.percentile(vals, 1)), 2),
-                    "P5": round(float(np.percentile(vals, 5)), 2),
-                    "P10": round(float(np.percentile(vals, 10)), 2),
-                    "中位數": round(float(np.median(vals)), 2),
-                    "跨度作廢": int(sum(1 for r in rr if not r["valid"])),
-                })
-            prog.empty()
-            if rows:
-                st.dataframe(pd.DataFrame(rows), width="stretch")
-                st.markdown("**如何讀**：P5 = 只有 5% 的日子跌幅比這更深。"
-                            "若你的門檻設在 P1，觸發樣本會少到無法做統計（鐵律10：n<10 不得下結論）。")
-                if spans:
-                    sp = np.array(spans)
-                    st.markdown("---")
-                    st.subheader("鐵律16：視窗跨度分布")
-                    a, b, c, d = st.columns(4)
-                    a.metric("跨度=14天（理論值）", "{:.1f}%".format(float((sp == NORMAL_SPAN_DAYS).mean() * 100)))
-                    b.metric("跨度中位數", "{:.0f} 天".format(float(np.median(sp))))
-                    c.metric("跨度最大", "{:.0f} 天".format(float(sp.max())))
-                    d.metric("超過上限({}天)".format(max_span), int((sp > max_span).sum()))
-                    st.caption("非14天者即為非營業日造成。此分布用於校準 MAX_SPAN_DAYS。")
-            else:
-                st.warning("無資料。")
-
-    # ══ Tab2：觸發掃描（鐵律16：須註記資料截至日）══
+    # ══ Tab2：📊 分布校準（ETF，走 yfinance 即時）══
     with tabs[2]:
-        st.subheader("現時觸發掃描")
-        if st.button("掃描", key="scan"):
-            rows = []
-            for code in picks:
-                px, err = fetch_prices(code, adjust)
-                if err or not px:
-                    continue
-                rr = calc_all_rolling_returns(px, ROLL_N, max_span)
-                if not rr:
-                    continue
-                last = rr[-1]
-                rows.append({
-                    "代碼": code,
-                    "分類": classify_etf(code),
-                    "滾動10日報酬%": "{:.2f}%".format(last["return"]),
-                    "資料截至": last["date"],          # ★ 鐵律16：使用者要求的註記
-                    "視窗跨度(曆日)": last["span_days"],
-                    "跨度有效": "✅" if last["valid"] else "❌ 作廢",
-                    "觸發": "🔴 是" if (last["return"] <= threshold and last["valid"]) else "—",
-                    "收盤": round(last["curr_price"], 2),
-                })
-            if rows:
-                st.dataframe(pd.DataFrame(rows), width="stretch")
-                st.caption("⚠️ **跨檔比較請看「資料截至」**：各標的最新資料日可能不同，"
-                           "同一張表上的標的未必處於同一實際日期（憲法十一-4）。")
-            else:
-                st.warning("無資料。")
+        st.subheader("📊 分布校準 — 先看分布，再訂門檻")
+        st.info("**為什麼要先看分布**：母專案門檻是在台股交易日曆上校準的，"
+                "基金/ETF 非營業日各異，直接套用會失準。先看實際跌幅分布再訂門檻。")
+        if not _HAS_YF:
+            st.error("yfinance 不可用，請確認 requirements.txt 含 yfinance。")
+        else:
+            etf_map, _src = fetch_etf_list()
+            codes_all = sorted(etf_map.keys())
+            _dft = [c for c in ["0050.TW", "006208.TW", "00878.TW", "0056.TW"]
+                    if c in codes_all] or codes_all[:4]
+            picks = st.multiselect("選擇 ETF（可多選）", codes_all,
+                                   default=_dft, key="pick_etf")
+            st.caption("清單來源：{}".format(_src))
+
+            if st.button("跑分布", type="primary", key="btn_dist"):
+                rows, spans = [], []
+                prog = st.progress(0.0)
+                for i, code in enumerate(picks):
+                    px, err = fetch_prices(code, adjust)
+                    prog.progress((i + 1) / max(len(picks), 1))
+                    if err or not px:
+                        st.warning("{}：{}".format(code, err or "無資料"))
+                        continue
+                    rr = calc_all_rolling_returns(px, ROLL_N, max_span)
+                    if not rr:
+                        continue
+                    vals = np.array([r["return"] for r in rr if r["valid"]], dtype=float)
+                    spans.extend([r["span_days"] for r in rr])
+                    if len(vals) == 0:
+                        continue
+                    dts = sorted(px.keys())
+                    rows.append({
+                        "代碼": code, "分類": classify_etf(code),
+                        "資料起": dts[0], "資料截至": dts[-1], "筆數": len(px),
+                        "年數": round((dt.date.fromisoformat(dts[-1])
+                                      - dt.date.fromisoformat(dts[0])).days / 365.25, 1),
+                        "P1": round(float(np.percentile(vals, 1)), 2),
+                        "P5": round(float(np.percentile(vals, 5)), 2),
+                        "P10": round(float(np.percentile(vals, 10)), 2),
+                        "中位數": round(float(np.median(vals)), 2),
+                    })
+                prog.empty()
+                if rows:
+                    st.dataframe(pd.DataFrame(rows), width="stretch")
+                    st.caption("**怎麼讀**：P5 = 只有 5% 的日子跌幅比這更深。"
+                               "門檻設在 P1 會少到沒樣本（n<10 無統計意義）。")
+                    if spans:
+                        sp = np.array(spans, dtype=float)
+                        st.markdown("**視窗跨度檢查**（正常應為 14 天）")
+                        q1, q2, q3 = st.columns(3)
+                        q1.metric("跨度=14天佔比",
+                                  "{:.1f}%".format(float((sp == 14).mean() * 100)))
+                        q2.metric("跨度中位數", "{:.0f} 天".format(float(np.median(sp))))
+                        q3.metric("超過上限筆數", int((sp > max_span).sum()))
+                else:
+                    st.warning("無資料。")
+
+    # ══ Tab1：🔍 個別基金分析（使用者要求：像個股版那樣做單檔深度分析）══
+    with tabs[1]:
+        st.subheader("🔍 個別基金分析")
+        st.caption("選一檔基金，看它的完整歷史：觸發點、各持有天數勝率、報酬分布、淨值走勢。")
+
+        hist_a, hsrc_a = load_history_db(None)   # 個別分析要完整歷史
+        if len(hist_a) == 0:
+            st.info("尚無歷史庫，請先用 GitHub Actions 建庫。")
+        else:
+            ac1, ac2, ac3 = st.columns([2, 1, 1])
+            # 用「名稱(代碼)」讓使用者好找
+            opts = (hist_a[["代碼", "名稱"]].drop_duplicates("代碼")
+                    .assign(_lab=lambda d: d["名稱"].astype(str) + "  (" + d["代碼"].astype(str) + ")")
+                    .sort_values("_lab"))
+            lab2code = dict(zip(opts["_lab"], opts["代碼"]))
+            pick_lab = ac1.selectbox("選擇基金（可打字搜尋）", list(lab2code.keys()))
+            thr_a = ac2.number_input("觸發門檻(%)", value=-10.0, step=0.5,
+                                     max_value=0.0, key="thr_a")
+            span_a = ac3.number_input("跨度上限(天)", value=max_span, step=1,
+                                      min_value=14, key="span_a")
+
+            if st.button("🔍 分析這檔", type="primary"):
+                code_a = lab2code[pick_lab]
+                one = hist_a[hist_a["代碼"] == code_a]
+                res = analyze_one_fund(one, thr_a, span_a)
+                if "error" in res:
+                    st.error(res["error"])
+                else:
+                    s = res["stats"]
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("資料年數", "{} 年".format(s["年數"]),
+                              help="{} ~ {}".format(s["資料起"], s["資料迄"]))
+                    m2.metric("歷史觸發次數", s["歷史觸發次數"],
+                              help="歷史上滾動10日跌幅達門檻的次數")
+                    m3.metric("最深跌幅", "{}%".format(s["最深跌幅"]))
+                    m4.metric("有效視窗", "{} / {}".format(
+                        s["有效視窗"], s["有效視窗"] + s["無效視窗"]),
+                        help="無效=淨值公告有大缺口，該筆不採計")
+
+                    if s["無效視窗"] > s["有效視窗"]:
+                        st.warning("⚠️ 這檔基金**超過一半的資料有缺口**（淨值公告不連續），"
+                                   "分析結果可信度低。")
+
+                    st.markdown("#### 📈 淨值走勢與觸發點")
+                    pr = res["prices"]
+                    dfp = pd.DataFrame({"日期": list(pr.keys()), "淨值": list(pr.values())})
+                    dfp = dfp.sort_values("日期")
+                    st.line_chart(dfp.set_index("日期")["淨值"], height=260)
+                    if res["triggers"]:
+                        tdf = pd.DataFrame([{
+                            "觸發日": t["date"], "滾動10日%": t["return"],
+                            "當時淨值": round(t["curr_price"], 4),
+                            "視窗跨度(天)": t["span_days"],
+                        } for t in res["triggers"]])
+                        st.markdown("#### 🔴 歷史觸發紀錄（共 {} 次）".format(len(tdf)))
+                        st.dataframe(tdf.sort_values("觸發日", ascending=False),
+                                     width="stretch", height=240)
+                    else:
+                        st.info("此門檻下無歷史觸發。試著放寬門檻"
+                                "（此檔 P5={}% / P10={}%）。".format(s["P5"], s["P10"]))
+
+                    tbl = res["timing_tbl"]
+                    if len(tbl):
+                        st.markdown("#### 🎯 各持有天數的勝率（觸發後進場）")
+                        st.dataframe(tbl, width="stretch")
+                        bi = res["best_idx"]
+                        if bi is not None:
+                            r = tbl.loc[bi]
+                            st.success("★ 最佳：持有 **{}** 天｜勝率 **{}**｜"
+                                       "平均報酬 {}｜樣本 {}".format(
+                                           r["持有天數"], r["勝率"],
+                                           r["平均報酬%"], r["樣本數"]))
+                        else:
+                            st.info("無任何持有天數樣本數≥{}，不硬推最佳"
+                                    "（樣本太少的勝率沒有統計意義）。".format(MIN_SAMPLE))
+
+                    st.markdown("#### 📊 滾動10日報酬分布")
+                    rr_all = [r["return"] for r in res["rolling"] if r["valid"]]
+                    if rr_all:
+                        d1, d2, d3, d4 = st.columns(4)
+                        d1.metric("P1", "{}%".format(round(float(np.percentile(rr_all, 1)), 2)))
+                        d2.metric("P5", "{}%".format(s["P5"]))
+                        d3.metric("P10", "{}%".format(s["P10"]))
+                        d4.metric("中位數", "{}%".format(s["中位數"]))
+                        st.caption("P5 = 只有 5% 的日子跌幅比這更深。門檻設太深會沒樣本。")
 
     # ══ Tab3：回測 ══
     with tabs[3]:
         st.subheader("回測")
+        picks = st.session_state.get('pick_etf', [])
         t1_picks = [c for c in picks if is_tier1(c)]
         skipped = [c for c in picks if not is_tier1(c)]
         if skipped:
