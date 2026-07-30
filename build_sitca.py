@@ -77,10 +77,17 @@ FILTER_REGIONS = [r.strip() for r in
 def csv_path_for(date_obj):
     """★分年拆檔★：每年一個CSV，避開 GitHub 單檔 100MB 限制。
 
-    全市場一天約4400筆，一年約110萬筆≈80-100MB → 剛好一年一檔最適當。
-    app 讀取時用 glob 合併所有年度檔。
+    ★致命bug修正★：原本回傳 sitca_nav_{年}.csv 不帶segment後綴，
+    導致4個平行job各自寫同名檔、在獨立機器上互不相見，merge時互相覆蓋
+    → 只剩最後一個job的1/4資料（實測：140天只存到33天、間隔6天=4段的1/4）。
+    修正：分年檔也帶segment後綴 sitca_nav_{年}_seg{NN}.csv，
+    各job寫各的，merge時全部保留，app用glob合併。
     """
+    if SEGMENT_TOTAL > 1:
+        return os.path.join(DATA_DIR, "sitca_nav_{}_seg{:02d}.csv".format(
+            date_obj.year, SEGMENT_INDEX))
     return os.path.join(DATA_DIR, "sitca_nav_{}.csv".format(date_obj.year))
+
 
 COMPANIES = {
     "A0001": "兆豐投信", "A0003": "第一金投信", "A0004": "滙豐投信", "A0005": "元大投信",
