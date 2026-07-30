@@ -322,7 +322,8 @@ def fetch_sitca_nav(company: str, date_str: str) -> Tuple[List[dict], str]:
 #   資料來源：data/sitca_nav.csv(境內) + data/offshore_nav.csv(境外)
 #   每檔標記境內/境外、投信/發行商，供篩選維度用（憲法：分類篩選後掃描）
 # ══════════════════════════════════════════════════════════════
-HIST_SITCA_GLOB = "data/sitca_nav_*.csv"   # 分年拆檔（避開GitHub 100MB限制）
+HIST_SITCA_GLOB = "data/sitca_nav_[0-9][0-9][0-9][0-9].csv"  # 只讀分年檔sitca_nav_YYYY.csv
+# ↑ 排除殘留的分段檔 sitca_nav_seg00.csv（跳著抓、不完整，混入會把跨度拉大→誤判資料稀疏）
 HIST_SITCA_LEGACY = "data/sitca_nav.csv"   # 舊版單檔（向後相容）
 HIST_OFFSHORE = "data/offshore_nav.csv"
 
@@ -857,10 +858,14 @@ def main():
         <style>
         .block-container {padding-top: 1.5rem; padding-left: 3rem;
                           padding-right: 3rem; max-width: 100%;}
-        [data-testid="stDataFrame"] {width: 100% !important;}
+        [data-testid="stDataFrame"] {width: 100% !important; border: none;}
+        [data-testid="stDataFrame"] > div {border: none !important;}
         [data-testid="stElementToolbar"] {display: none;}
         .stTabs [data-baseweb="tab-list"] {gap: 8px;}
         .stTabs [data-baseweb="tab"] {height: 44px; font-size: 15px;}
+        /* 移除各元件外框陰影，減少「框中框」的 iframe 感 */
+        [data-testid="stVerticalBlock"] {gap: 0.8rem;}
+        iframe {border: none !important;}
         </style>
     """, unsafe_allow_html=True)
     st.title("📉 台灣基金滾動跌幅系統")
@@ -947,8 +952,11 @@ def main():
                     c.metric("觸發門檻", "{}%".format(scan_thr))
                     if n_trig > 0:
                         st.success("**今天有 {} 檔觸發跌幅** — 下方紅點標記，已配對歷史勝率供你判斷。".format(n_trig))
+                    # 動態高度：讓表格整個攤平、隨頁面捲動，不產生內部捲動框(iframe感)
+                    # 每列約35px + 表頭38px；上限3000px避免超長，超過才用捲動
+                    _rows_h = min(len(result) * 35 + 38, 3000)
                     st.dataframe(
-                        result, width="stretch", height=520,
+                        result, width="stretch", height=_rows_h,
                         column_config={
                             "滾動10日%": st.column_config.NumberColumn(
                                 "滾動10日%", format="%.2f%%",
