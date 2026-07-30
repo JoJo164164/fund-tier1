@@ -322,8 +322,8 @@ def fetch_sitca_nav(company: str, date_str: str) -> Tuple[List[dict], str]:
 #   資料來源：data/sitca_nav.csv(境內) + data/offshore_nav.csv(境外)
 #   每檔標記境內/境外、投信/發行商，供篩選維度用（憲法：分類篩選後掃描）
 # ══════════════════════════════════════════════════════════════
-HIST_SITCA_GLOB = "data/sitca_nav_[0-9][0-9][0-9][0-9].csv"  # 只讀分年檔sitca_nav_YYYY.csv
-# ↑ 排除殘留的分段檔 sitca_nav_seg00.csv（跳著抓、不完整，混入會把跨度拉大→誤判資料稀疏）
+HIST_SITCA_GLOB = "data/sitca_nav_[0-9][0-9][0-9][0-9]*.csv"  # 分年檔(可含_segNN後綴)
+# 匹配 sitca_nav_2026.csv 及 sitca_nav_2026_seg00.csv；排除舊單檔sitca_nav.csv
 HIST_SITCA_LEGACY = "data/sitca_nav.csv"   # 舊版單檔（向後相容）
 HIST_OFFSHORE = "data/offshore_nav.csv"
 
