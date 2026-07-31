@@ -50,6 +50,13 @@ EFFECTIVE_SLEEP = SLEEP * max(_SEG_N, 1)
 TIME_BUDGET_MIN = int(os.environ.get("SITCA_TIME_BUDGET", "300"))
 DAYS_BACK = int(os.environ.get("SITCA_DAYS_BACK", "250"))  # 預設約1年；15年填3800
 
+# ★ 斷路器：連續 FAIL_STREAK_LIMIT 個日期「丟出逾時例外」就中止本段(sys.exit 1)。
+#   目的：某台 runner 的 IP 被 SITCA 丟包後，會每個請求都 ReadTimeout；若不早死，
+#   會硬撞到 workflow 的 350 分鐘 timeout 才停（實測浪費 3+ 小時）。
+#   ★只計「例外」，不計「空資料」★：假日(境內連休/美股休市)回空是合法的、
+#   代表伺服器有回應、連線健康，遇到就重置 streak，避免春節連假被誤判中止。
+FAIL_STREAK_LIMIT = int(os.environ.get("SITCA_FAIL_STREAK", "6"))
+
 # ★ 平行化分段（GitHub Actions matrix）：把日期切成 N 段同時跑，總時間 ÷ N
 #   SEGMENT_TOTAL=20 + SEGMENT_INDEX=0..19 → 20個job平行，29小時→1.5小時
 #   每段寫自己的CSV（避免多job寫同檔衝突），app讀取時自動合併所有分段檔
@@ -384,6 +391,7 @@ def main():
     t0 = time.time()
     new_records = 0
     tasks_done = 0
+    fail_streak = 0   # 連續逾時例外計數（供斷路器判斷 IP 是否被阻擋）
 
     for company in companies:
         cname = "所有公司" if company == "ALL" else COMPANIES.get(company, company)
@@ -409,13 +417,31 @@ def main():
                     err = "{}: {}".format(type(e).__name__, str(e)[:60])
                     tok_cache = None  # 清快取重新取乾淨token
                     if attempt < 2:
-                        print("    ⟳ 重試 {}/3（{}）".format(attempt + 1, err))
-                        time.sleep(EFFECTIVE_SLEEP * 2)
+                        # 指數退避：×2、×4，給被暫時限速的連線恢復時間
+                        backoff = EFFECTIVE_SLEEP * (2 ** (attempt + 1))
+                        print("    ⟳ 重試 {}/3（{}）退避 {:.1f}s".format(
+                            attempt + 1, err, backoff))
+                        time.sleep(backoff)
                     else:
                         rows = []
             if err or not rows:
                 print("  ✗ {} {} → {}".format(cname, date_str, err or "無資料"))
                 tok_cache = None
+                if err:
+                    # 真的丟出例外(逾時/連線錯) → 累加；連續達門檻就判 IP 被擋、中止
+                    fail_streak += 1
+                    if fail_streak >= FAIL_STREAK_LIMIT:
+                        save_progress(done)
+                        print("=" * 60)
+                        print("🛑 連續 {} 個日期全部逾時/失敗 → 判定本段 runner IP 被 "
+                              "SITCA 阻擋/丟包，主動中止本段（不硬撞 350 分鐘）。".format(fail_streak))
+                        print("   這不是資料問題。請【重跑】(會拿到新的 runner IP)；"
+                              "若重覆發生，調高 workflow 的 sleep_sec 或降低 parallel。")
+                        print("=" * 60)
+                        raise SystemExit(1)
+                else:
+                    # 空資料=假日(境內連休/美股休市)，伺服器有回應→連線健康→重置
+                    fail_streak = 0
                 time.sleep(EFFECTIVE_SLEEP)
                 continue
 
@@ -451,6 +477,7 @@ def main():
                 })
             append_csv(recs, d)
             done.add(key)
+            fail_streak = 0   # 成功抓到 → 連線健康，重置斷路器計數
             new_records += len(recs)
             tasks_done += 1
             n_active = sum(1 for r in recs if r["分類"].startswith("主動ETF"))
