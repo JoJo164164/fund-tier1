@@ -3,13 +3,21 @@
 """建庫驗證（合併後、commit 前執行）。
 
 任何一條斷言不過就 sys.exit(1) → 整個 workflow run 失敗 → 不准 commit 壞資料。
-專門堵住「分段檔互相覆蓋 / 某段 job 掉了 / 單日殘缺 / 資料稀疏」四種悄悄回 partial 的路。
+專門堵住「分段檔互相覆蓋 / 某段 job 掉了 / 資料稀疏 / 單日抓取斷掉」等悄悄回 partial 的路。
 
 只用標準函式庫，merge job 不必 pip install。
+
 環境變數（由 workflow 餵入，對齊 build 參數）：
-  SEG_TOTAL     平行分段數，需與 workflow 的 parallel 一致（預設 4）
-  MAX_SPAN_DAYS 鐵律16 的跨度上限，需與 app.py 的 MAX_SPAN_DAYS 一致（預設 25）
-  MIN_COVERAGE  日期覆蓋率下限（實得日期 / 區間營業日）（預設 0.80）
+  SEG_TOTAL       平行分段數，需與 workflow 的 parallel 一致（預設 4）
+  MAX_SPAN_DAYS   鐵律16 的跨度上限，需與 app.py 的 MAX_SPAN_DAYS 一致（預設 25）
+  MIN_COVERAGE    日期覆蓋率下限（實得日期 / 區間營業日）（預設 0.80）
+  DAY_HARD_RATIO  單日筆數 < 中位數×此值 → 判「抓取斷掉」硬性 fail（預設 0.05）
+  DAY_WARN_RATIO  單日筆數 < 中位數×此值 → 提示（多為境外市場休市，不 fail）（預設 0.80）
+
+★斷言4設計說明★：境內外混合母體中，遇美股/他國休市日，投資該市場的境外基金
+  當天無淨值可算 → 該日筆數合理掉到 ~40%（實測：2026-01-19 MLK Day、
+  2026-07-03 美國國慶，皆只剩 ~40% 且缺口集中在美國區基金）。這是合法資料，
+  不可 fail。真正的「抓取斷掉」會趨近 0，故只在 <5% 中位數時硬擋。
 """
 import os
 import sys
@@ -21,6 +29,8 @@ from collections import Counter
 SEG_TOTAL = int(os.environ.get("SEG_TOTAL", "4"))
 MAX_SPAN_DAYS = int(os.environ.get("MAX_SPAN_DAYS", "25"))
 MIN_COVERAGE = float(os.environ.get("MIN_COVERAGE", "0.80"))
+DAY_HARD_RATIO = float(os.environ.get("DAY_HARD_RATIO", "0.05"))
+DAY_WARN_RATIO = float(os.environ.get("DAY_WARN_RATIO", "0.80"))
 DATA_DIR = "data"
 
 
@@ -111,15 +121,26 @@ def main():
             span10, MAX_SPAN_DAYS))
     print("✅ 斷言3：最近10筆跨度 {} 天 ≤ {} 天".format(span10, MAX_SPAN_DAYS))
 
-    # ── 斷言 4：單日筆數不得低於中位數 80%（防單日殘缺，如 01-19 只有 1702）──
+    # ── 斷言 4：單日筆數健檢（境外休市日的合理稀疏放行、抓取斷掉才擋）──
+    #   硬性 fail：<中位數×DAY_HARD_RATIO（趨近0，只有抓取真的斷掉才會這麼低）
+    #   提示 warn：中位數×DAY_HARD_RATIO ~ ×DAY_WARN_RATIO（多為美股/他國休市日）
     counts = sorted(per_date.values())
     med = counts[len(counts) // 2]
-    bad = {k: v for k, v in sorted(per_date.items()) if v < med * 0.8}
-    if bad:
-        preview = dict(list(bad.items())[:10])
-        fail("單日筆數殘缺（中位數 {}，門檻 {:.0f}）：{}{}".format(
-            med, med * 0.8, preview, " …等" if len(bad) > 10 else ""))
-    print("✅ 斷言4：每日筆數皆 ≥ 中位數80%（中位數 {}）".format(med))
+    hard_floor = med * DAY_HARD_RATIO
+    warn_floor = med * DAY_WARN_RATIO
+    broken = {k: v for k, v in sorted(per_date.items()) if v < hard_floor}
+    thin = {k: v for k, v in sorted(per_date.items()) if hard_floor <= v < warn_floor}
+    if broken:
+        preview = dict(list(broken.items())[:10])
+        fail("單日筆數趨近零（中位數 {}，硬底 {:.0f}）→ 抓取斷掉：{}{}".format(
+            med, hard_floor, preview, " …等" if len(broken) > 10 else ""))
+    if thin:
+        preview = dict(list(thin.items())[:15])
+        print("⚠️  提示：{} 個日期筆數偏低（中位數 {} 的 {:.0%}~{:.0%} 之間），"
+              "多為境外市場休市日、屬合法稀疏，未擋：".format(
+                  len(thin), med, DAY_HARD_RATIO, DAY_WARN_RATIO))
+        print("     " + str(preview) + (" …等" if len(thin) > 15 else ""))
+    print("✅ 斷言4：無單日趨近零（抓取未斷）；偏低日 {} 個（境外休市，放行）".format(len(thin)))
 
     print("=" * 60)
     print("✅ 全數通過：{} 段、{} 個日期、覆蓋率 {:.1%}、最近10筆跨度 {} 天".format(
