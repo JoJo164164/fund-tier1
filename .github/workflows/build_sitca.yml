@@ -111,11 +111,21 @@ jobs:
       - name: 合併分段檔案
         run: |
           mkdir -p data
-          cp -rn _segs/*/* data/ 2>/dev/null || true
+          # ★修正★：原本 cp -rn（no-clobber）會在「先煙霧後全量/斷點續傳」時
+          #   因 data/ 已有舊版分段檔而【跳過覆蓋】→ 完整版被丟掉、判無新資料。
+          #   build job 一定是「checkout既有檔→append」，artifact 永遠是超集，
+          #   故合併時必須【無條件以 artifact 為準】→ 改用 cp -rf。
+          cp -rf _segs/*/* data/ 2>/dev/null || true
           echo "合併後 data/ 內容："
           ls -lh data/
           echo "總筆數："
           cat data/sitca_nav*.csv 2>/dev/null | grep -c "" || echo 0
+      - name: 建庫驗證(缺段/覆蓋/稀疏/單日殘缺 → fail，不准commit)
+        env:
+          SEG_TOTAL: ${{ github.event.inputs.parallel }}
+          MAX_SPAN_DAYS: '25'
+          MIN_COVERAGE: '0.80'
+        run: python3 verify_build.py
       - name: 提交回 repo
         run: |
           git config user.name "github-actions[bot]"
