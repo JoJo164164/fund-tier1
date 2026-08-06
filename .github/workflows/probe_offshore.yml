@@ -1,0 +1,20 @@
+name: 境外來源探針 (yfinance 可行性)
+
+# 手動跑：實測 ISIN→Yahoo 0P→yfinance 抓5年，回報覆蓋率與歷史深度。
+# 只印報告、不寫庫、不 commit。決定境外要不要走 yfinance 全市場 backfill。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests yfinance
+      - name: 跑探針
+        run: python -u probe_offshore.py
