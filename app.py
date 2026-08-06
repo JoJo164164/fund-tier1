@@ -424,13 +424,16 @@ LIVE_TOPUP_CAP_DAYS = 15   # 一次即時最多補幾個營業日（避免庫太
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def _fetch_sitca_days(date_strs: tuple) -> Dict[str, Dict[str, float]]:
+def _fetch_sitca_days(date_strs: tuple):
     """即時抓 SITCA 指定日期(YYYYMMDD)的全市場淨值。快取30分。
-    回 {iso日期: {代碼: 淨值float}}。某日無資料(假日/未公布)→ 空 dict。"""
+    回 (data, msgs)：data={iso: {代碼: 淨值float}}；msgs={iso: 診斷訊息}。
+    某日無資料(假日/未公布)或抓取失敗 → 該日 data 空 dict、msgs 記原因。"""
     result: Dict[str, Dict[str, float]] = {}
+    msgs: Dict[str, str] = {}
     for ds in date_strs:
         iso = "{}-{}-{}".format(ds[:4], ds[4:6], ds[6:8])
-        rows, _msg = fetch_sitca_nav("ALL", ds)
+        rows, msg = fetch_sitca_nav("ALL", ds)
+        msgs[iso] = msg
         m: Dict[str, float] = {}
         for r in rows:
             code = r.get("代碼")
@@ -442,7 +445,7 @@ def _fetch_sitca_days(date_strs: tuple) -> Dict[str, Dict[str, float]]:
             except ValueError:
                 continue
         result[iso] = m
-    return result
+    return result, msgs
 
 
 def live_topup_domestic(hist: pd.DataFrame, cap_days: int = LIVE_TOPUP_CAP_DAYS):
@@ -474,7 +477,7 @@ def live_topup_domestic(hist: pd.DataFrame, cap_days: int = LIVE_TOPUP_CAP_DAYS)
         need = need[-cap_days:]  # 只補最近 cap_days 天
     date_strs = tuple(dd.strftime("%Y%m%d") for dd in need)
 
-    fetched = _fetch_sitca_days(date_strs)
+    fetched, fmsgs = _fetch_sitca_days(date_strs)
 
     # 用庫裡既有基金的屬性當母表，補上新日期的淨值
     attr = (dom.drop_duplicates("代碼")
@@ -493,7 +496,14 @@ def live_topup_domestic(hist: pd.DataFrame, cap_days: int = LIVE_TOPUP_CAP_DAYS)
                     "資產類型": a["資產類型"], "投資區域": a["投資區域"],
                 })
     if not supp:
-        return hist, "即時補：最近 {} 個營業日皆無新資料（假日/淨值未公布）".format(len(need))
+        # 診斷真因：抓取失敗 vs 真的空 vs 代碼對不上（別再誤標「假日」）
+        errs = [m for m in fmsgs.values() if m and ("例外" in m or "失敗" in m)]
+        any_rows = any(len(m) > 0 for m in fetched.values())
+        if errs:
+            return hist, "⚠️ 即時抓取失敗（本次用庫最新）：{}".format(errs[0][:140])
+        if any_rows:
+            return hist, "⚠️ 即時抓到資料但代碼對不上庫，本次用庫最新（需查代碼格式）"
+        return hist, "即時補：最近 {} 個營業日 SITCA 皆回空（假日或淨值尚未公布）".format(len(need))
 
     supp_df = pd.DataFrame(supp)
     merged = pd.concat([hist, supp_df], ignore_index=True)
@@ -1068,39 +1078,38 @@ def main():
                     c.metric("觸發門檻", "{}%".format(scan_thr))
                     if n_trig > 0:
                         st.success("**今天有 {} 檔觸發跌幅** — 下方紅點標記，已配對歷史勝率供你判斷。".format(n_trig))
-                    # 動態高度：讓表格整個攤平、隨頁面捲動，不產生內部捲動框(iframe感)
-                    # 高度=內容實高(每列約36px+表頭緩衝60)，不設上限→無內捲軸、整頁捲動
-                    _rows_h = len(result) * 36 + 60
-                    st.dataframe(
-                        result, width="stretch", height=_rows_h,
-                        column_config={
-                            "滾動10日%": st.column_config.NumberColumn(
-                                "滾動10日%", format="%.2f%%",
-                                help="最新淨值 vs 往回第10筆淨值的報酬率。負值=下跌。"),
-                            "今日觸發": st.column_config.TextColumn(
-                                "今日觸發",
-                                help="最新一筆滾動10日跌幅是否達到你設定的門檻。🔴是=今天可考慮進場。"),
-                            "連續觸發天": st.column_config.NumberColumn(
-                                "連續觸發天",
-                                help="從最新往回數，連續有幾筆達門檻。數字大=跌勢持續中，可能還沒落底。"),
-                            "淨值截至": st.column_config.TextColumn(
-                                "淨值截至",
-                                help="這檔基金最新淨值的日期。境外基金有時差，各檔可能不同。"),
-                            "資料品質": st.column_config.TextColumn(
-                                "資料品質",
-                                help="往回10筆淨值實際橫跨幾天。正常14天。橫跨太久代表淨值公告有大缺口，"
-                                     "算出的『10日跌幅』其實是好幾個月的跌幅，不可信，故不採計。"),
-                            "歷史觸發次數": st.column_config.TextColumn(
-                                "歷史觸發次數",
-                                help="這檔基金歷史上總共觸發過幾次此門檻。次數太少(<10)勝率沒有統計意義。"),
-                            "歷史最佳勝率": st.column_config.TextColumn(
-                                "歷史最佳勝率",
-                                help="歷史上觸發後進場，在最佳持有天數下賺錢的比例。"
-                                     "只有樣本≥10才顯示（樣本太少的勝率是雜訊）。"),
-                            "最佳持有天": st.column_config.TextColumn(
-                                "最佳持有天",
-                                help="歷史回測中勝率最高的持有天數。"),
-                        })
+                    # ── 攤平表格（靜態HTML，隨頁面捲動、無iframe內捲軸；Q2修正）──
+                    #   不用 st.dataframe(固定height)：4700列會需169k px高度→render失敗變空白。
+                    #   改 to_html + st.markdown，整頁自然捲動、表頭sticky、無內捲框。
+                    _disp = result.copy()
+                    if "滾動10日%" in _disp.columns:
+                        _disp["滾動10日%"] = _disp["滾動10日%"].map(
+                            lambda v: "{:.2f}%".format(v) if pd.notna(v) else "")
+                    st.markdown(
+                        "<style>"
+                        ".scan-wrap{width:100%;overflow-x:auto;}"
+                        "table.scan-tbl{border-collapse:collapse;width:100%;font-size:14px;}"
+                        "table.scan-tbl thead th{position:sticky;top:0;background:#f0f2f6;"
+                        "z-index:1;text-align:left;padding:8px 10px;"
+                        "border-bottom:2px solid #d0d3d9;white-space:nowrap;}"
+                        "table.scan-tbl tbody td{padding:6px 10px;"
+                        "border-bottom:1px solid #eceef1;white-space:nowrap;}"
+                        "table.scan-tbl tbody tr:nth-child(even){background:#fafbfc;}"
+                        "table.scan-tbl tbody tr:hover{background:#eef4ff;}"
+                        "</style>", unsafe_allow_html=True)
+                    _html = _disp.to_html(index=False, escape=False, border=0,
+                                          classes="scan-tbl")
+                    st.markdown('<div class="scan-wrap">' + _html + "</div>",
+                                unsafe_allow_html=True)
+                    with st.expander("欄位說明（原滑鼠提示）"):
+                        st.markdown(
+                            "- **滾動10日%**：最新淨值 vs 往回第10筆淨值的報酬率，負值=下跌\n"
+                            "- **今日觸發**：最新滾動10日跌幅是否達門檻。🔴是=今天可考慮進場\n"
+                            "- **連續觸發天**：從最新往回連續達門檻的筆數，越大代表跌勢持續中\n"
+                            "- **淨值截至**：該檔最新淨值日期（境內即時補到今天、境外用庫最新，各檔可不同）\n"
+                            "- **資料品質**：往回10筆橫跨天數；正常約14天，橫跨太久=有大缺口故不採計\n"
+                            "- **歷史觸發次數**：歷史總觸發次數，<10 勝率無統計意義\n"
+                            "- **歷史最佳勝率／最佳持有天**：觸發後於最佳持有天數的賺錢比例（樣本≥10才顯示）")
                     # 資料品質警示（使用者反映「很多空白」的根因）
                     bad = (result["資料品質"].astype(str).str.contains("稀疏")).sum()
                     if bad:
