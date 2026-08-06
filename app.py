@@ -1047,11 +1047,11 @@ def main():
             st.caption("篩選後範圍：{} 檔基金（縮小範圍可加快掃描）".format(n_funds))
 
             live_on = st.checkbox(
-                "☀️ 掃描前即時補最新（境內拿今天，較慢）", value=True,
-                help="開啟：掃描前即時抓 SITCA 最新幾天淨值併入，讓滾動10日以『今天』收尾、"
-                     "觸發訊號是今天的（每次掃描多花幾秒，結果快取30分）。"
-                     "關閉：只用已建好的歷史庫（可能落後到上次建庫日）。"
-                     "境外基金無即時源，一律用庫最新。")
+                "☀️ 掃描前即時補最新（境內；僅在能連到 SITCA 的環境有效）", value=False,
+                help="本部署環境(Streamlit Cloud)的 SITCA POST 會被回 404 擋掉，故預設關閉。"
+                     "資料新鮮度改由『每日排程(topup_daily.yml)』每天傍晚補進庫，"
+                     "app 讀靜態庫即為 ≤1 天新。若你在能連 SITCA 的環境(如台灣本機)跑，"
+                     "可勾選開啟即時補。")
 
             if st.button("☀️ 掃描今日觸發", type="primary"):
                 work = view
