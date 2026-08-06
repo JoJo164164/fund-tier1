@@ -414,6 +414,99 @@ def hist_to_prices(df_one: pd.DataFrame) -> Dict[str, float]:
     return dict(zip(d["日期"].astype(str), d["淨值"].astype(float)))
 
 
+# ══════════════════════════════════════════════════════════════
+# 即時補最新（PENDING#1，Greg 選 A：app 掃描前即時抓，境內拿今天）
+#   目的：靜態庫最新日 = 上次建庫時間；掃描前即時抓「庫最新日之後~今天」的
+#         境內淨值併回，讓滾動10日以「今天」收尾，觸發訊號是今天的。
+#   境外：無即時源（境外建庫=PENDING#3），一律用庫最新，不動。
+# ══════════════════════════════════════════════════════════════
+LIVE_TOPUP_CAP_DAYS = 15   # 一次即時最多補幾個營業日（避免庫太舊時現抓上百天）
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _fetch_sitca_days(date_strs: tuple) -> Dict[str, Dict[str, float]]:
+    """即時抓 SITCA 指定日期(YYYYMMDD)的全市場淨值。快取30分。
+    回 {iso日期: {代碼: 淨值float}}。某日無資料(假日/未公布)→ 空 dict。"""
+    result: Dict[str, Dict[str, float]] = {}
+    for ds in date_strs:
+        iso = "{}-{}-{}".format(ds[:4], ds[4:6], ds[6:8])
+        rows, _msg = fetch_sitca_nav("ALL", ds)
+        m: Dict[str, float] = {}
+        for r in rows:
+            code = r.get("代碼")
+            nav = r.get("淨值")
+            if not code or nav in (None, "", "-"):
+                continue
+            try:
+                m[code] = float(str(nav).replace(",", ""))
+            except ValueError:
+                continue
+        result[iso] = m
+    return result
+
+
+def live_topup_domestic(hist: pd.DataFrame, cap_days: int = LIVE_TOPUP_CAP_DAYS):
+    """掃描前即時補最新：抓「庫最新日之後 ~ 今天」的境內淨值，併回 hist。
+    回傳 (補後的hist, 說明字串)。只補已在庫的基金(新基金無歷史算不了滾動)。"""
+    if not _HAS_REQ:
+        return hist, "requests 不可用，略過即時補（用庫最新）"
+    dom = hist[hist["境內外"] == "境內"]
+    if len(dom) == 0:
+        return hist, "無境內資料可補"
+    db_latest = max(dom["日期"].astype(str))
+    try:
+        last_d = dt.date.fromisoformat(db_latest)
+    except ValueError:
+        return hist, "庫日期格式異常，略過即時補"
+
+    today = dt.date.today()
+    need = []
+    d = last_d + dt.timedelta(days=1)
+    while d <= today:
+        if d.weekday() < 5:      # 只抓營業日(週一~五)；假日 SITCA 回空自然略過
+            need.append(d)
+        d += dt.timedelta(days=1)
+    if not need:
+        return hist, "庫已是最新（{}），無需即時補".format(db_latest)
+
+    over = len(need) > cap_days
+    if over:
+        need = need[-cap_days:]  # 只補最近 cap_days 天
+    date_strs = tuple(dd.strftime("%Y%m%d") for dd in need)
+
+    fetched = _fetch_sitca_days(date_strs)
+
+    # 用庫裡既有基金的屬性當母表，補上新日期的淨值
+    attr = (dom.drop_duplicates("代碼")
+               .set_index("代碼")[["名稱", "發行", "資產類型", "投資區域"]])
+    supp = []
+    got_days = 0
+    for iso, m in fetched.items():
+        if m:
+            got_days += 1
+        for code, nav in m.items():
+            if code in attr.index:
+                a = attr.loc[code]
+                supp.append({
+                    "代碼": code, "日期": iso, "淨值": nav,
+                    "名稱": a["名稱"], "境內外": "境內", "發行": a["發行"],
+                    "資產類型": a["資產類型"], "投資區域": a["投資區域"],
+                })
+    if not supp:
+        return hist, "即時補：最近 {} 個營業日皆無新資料（假日/淨值未公布）".format(len(need))
+
+    supp_df = pd.DataFrame(supp)
+    merged = pd.concat([hist, supp_df], ignore_index=True)
+    merged = merged.drop_duplicates(["代碼", "日期"], keep="last")
+    newest = max(supp_df["日期"])
+    msg = "境內即時補到 {}（新增 {} 天 / {:,} 筆，庫原本止於 {}）".format(
+        newest, got_days, len(supp_df), db_latest)
+    if over:
+        msg += "；⚠️ 庫落後 >{} 天，只補了最近 {} 天，建議重跑建庫補齊中間".format(
+            cap_days, cap_days)
+    return merged, msg
+
+
 def scan_history_db(df: pd.DataFrame, threshold: float,
                     max_span: int = MAX_SPAN_DAYS) -> pd.DataFrame:
     """每早掃描核心：對歷史庫每檔算「最新滾動跌幅」+ 歷史勝率。
@@ -939,9 +1032,32 @@ def main():
             n_funds = view["代碼"].nunique()
             st.caption("篩選後範圍：{} 檔基金（縮小範圍可加快掃描）".format(n_funds))
 
+            live_on = st.checkbox(
+                "☀️ 掃描前即時補最新（境內拿今天，較慢）", value=True,
+                help="開啟：掃描前即時抓 SITCA 最新幾天淨值併入，讓滾動10日以『今天』收尾、"
+                     "觸發訊號是今天的（每次掃描多花幾秒，結果快取30分）。"
+                     "關閉：只用已建好的歷史庫（可能落後到上次建庫日）。"
+                     "境外基金無即時源，一律用庫最新。")
+
             if st.button("☀️ 掃描今日觸發", type="primary"):
-                with st.spinner("掃描 {} 檔，計算滾動跌幅+歷史勝率…".format(n_funds)):
-                    result = scan_history_db(view, scan_thr, MAX_SPAN_DAYS)
+                work = view
+                if live_on:
+                    with st.spinner("即時補最新淨值（境內）…"):
+                        hist2, topup_msg = live_topup_domestic(hist)
+                    st.caption("🔄 " + topup_msg)
+                    # 補過的庫要重新套一次相同篩選
+                    work = hist2
+                    if pick_region != "全部":
+                        work = work[work["境內外"] == pick_region]
+                    if pick_issuer != "全部":
+                        work = work[work["發行"] == pick_issuer]
+                    if pick_asset != "全部":
+                        work = work[work["資產類型"] == pick_asset]
+                    if pick_area != "全部":
+                        work = work[work["投資區域"] == pick_area]
+                with st.spinner("掃描 {} 檔，計算滾動跌幅+歷史勝率…".format(
+                        work["代碼"].nunique())):
+                    result = scan_history_db(work, scan_thr, MAX_SPAN_DAYS)
                 if len(result) == 0:
                     st.warning("無足夠歷史資料可掃描。")
                 else:
@@ -953,8 +1069,8 @@ def main():
                     if n_trig > 0:
                         st.success("**今天有 {} 檔觸發跌幅** — 下方紅點標記，已配對歷史勝率供你判斷。".format(n_trig))
                     # 動態高度：讓表格整個攤平、隨頁面捲動，不產生內部捲動框(iframe感)
-                    # 每列約35px + 表頭38px；上限3000px避免超長，超過才用捲動
-                    _rows_h = min(len(result) * 35 + 38, 3000)
+                    # 高度=內容實高(每列約36px+表頭緩衝60)，不設上限→無內捲軸、整頁捲動
+                    _rows_h = len(result) * 36 + 60
                     st.dataframe(
                         result, width="stretch", height=_rows_h,
                         column_config={
