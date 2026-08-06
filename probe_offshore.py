@@ -1,17 +1,12 @@
 # -*- coding: utf-8 -*-
-"""境外歷史來源探針（yfinance 可行性驗證）
+"""境外歷史來源探針 v2（yfinance 可行性 · 改進反查）
 =====================================================
-目的：在寫全市場 backfill 前，先實測「TDCC 的 ISIN → Yahoo 0P 代碼 → yfinance 抓幾年」
-      這整條鏈能不能撐起 5 年回測。沙盒無網路，必須在 GitHub Actions 實跑。
-
-流程（每檔）：
-  ① 用 ISIN 打 Yahoo 搜尋 API 反查符號(通常是共同基金 0P 代碼)
-  ② 用該符號 yfinance.history(period="5y") 實抓，數回傳幾年、幾筆
-輸出：逐檔結果 + 彙總(解析率、≥3年比例、≥5年比例、平均年數) → 決定要不要走 yfinance。
+v1 教訓：ISIN 反查常挑到德國交易所次級掛牌(.F/.MU/.SG/.HM)→0~1筆垃圾；
+        該嚴格優先 Yahoo 的 0P 共同基金代碼(有完整NAV歷史)。
+v2 反查順序：① 0P 代碼 ② 美國乾淨ticker(無交易所後綴) ③ 其他非次級掛牌符號。
+   抓 period="max" 取最大深度；失敗時印候選符號，判斷是「漏挑」還是「Yahoo無此檔」。
 """
 import time
-import datetime as dt
-
 import requests
 try:
     import yfinance as yf
@@ -22,8 +17,10 @@ except ImportError:
 YH_SEARCH = "https://query2.finance.yahoo.com/v1/finance/search"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+# 不信任的交易所次級掛牌後綴（這些沒NAV序列）
+BAD_SUFFIX = (".F", ".MU", ".SG", ".HM", ".DE", ".BE", ".DU", ".HA", ".L",
+              ".VI", ".SW", ".MI", ".PA", ".AS", ".BR", ".MA", ".IR")
 
-# 25 檔知名境外基金（真實 ISIN，取自 TDCC 開放資料；涵蓋美/歐/亞、股/債/產業）
 SEED = [
     ("US8801991048", "富蘭克林坦伯頓成長基金A"),
     ("US8801961009", "富蘭克林坦伯頓世界基金A"),
@@ -53,78 +50,86 @@ SEED = [
 ]
 
 
-def resolve_symbol(isin):
-    """ISIN → Yahoo 符號。回 (symbol, quoteType) 或 (None, 原因)。"""
+def search_candidates(isin):
     try:
-        r = requests.get(YH_SEARCH, params={"q": isin, "quotesCount": 5},
+        r = requests.get(YH_SEARCH, params={"q": isin, "quotesCount": 15},
                          headers=HEADERS, timeout=20)
         if r.status_code != 200:
-            return None, "search HTTP {}".format(r.status_code)
-        quotes = r.json().get("quotes", [])
-        if not quotes:
-            return None, "無搜尋結果"
-        # 優先取共同基金 / 0P 代碼
-        for q in quotes:
-            sym = q.get("symbol", "")
-            if q.get("quoteType") == "MUTUALFUND" or sym.startswith("0P"):
-                return sym, q.get("quoteType", "?")
-        return quotes[0].get("symbol"), quotes[0].get("quoteType", "?")
+            return [], "search HTTP {}".format(r.status_code)
+        return r.json().get("quotes", []), None
     except Exception as e:
-        return None, "{}: {}".format(type(e).__name__, str(e)[:40])
+        return [], "{}: {}".format(type(e).__name__, str(e)[:40])
+
+
+def pick_symbol(quotes):
+    syms = [q.get("symbol", "") for q in quotes if q.get("symbol")]
+    # ① 0P 代碼最優先（Yahoo 共同基金 NAV 序列）
+    for s in syms:
+        if s.startswith("0P"):
+            return s, "0P"
+    # ② 美國乾淨 ticker（MUTUALFUND 且無交易所後綴）
+    for q in quotes:
+        s = q.get("symbol", "")
+        if q.get("quoteType") == "MUTUALFUND" and "." not in s and s:
+            return s, "US基金"
+    # ③ 任何非次級掛牌後綴的符號
+    for s in syms:
+        if s and not any(s.endswith(suf) for suf in BAD_SUFFIX):
+            return s, "其他"
+    return None, "只有交易所次級掛牌"
 
 
 def years_of(symbol):
-    """yfinance 抓 5 年，回 (年數, 筆數, 最早, 最新) 或 (0,0,錯誤)。"""
     try:
-        df = yf.Ticker(symbol).history(period="5y", auto_adjust=True)
+        df = yf.Ticker(symbol).history(period="max", auto_adjust=True)
         if df is None or len(df) == 0:
             return 0, 0, "empty", ""
         idx = df.index
         yrs = round((idx.max() - idx.min()).days / 365.25, 1)
         return yrs, len(df), str(idx.min().date()), str(idx.max().date())
     except Exception as e:
-        return 0, 0, "{}: {}".format(type(e).__name__, str(e)[:40]), ""
+        return 0, 0, "{}: {}".format(type(e).__name__, str(e)[:30]), ""
 
 
 def main():
-    print("=" * 72)
-    print("境外歷史來源探針  yfinance可用:", _HAS_YF, " 測試", len(SEED), "檔")
-    print("=" * 72)
+    print("=" * 76)
+    print("境外歷史探針 v2  yfinance:", _HAS_YF, " 測", len(SEED), "檔（改進反查+抓max）")
+    print("=" * 76)
     if not _HAS_YF:
-        raise SystemExit("yfinance 未安裝（workflow 需 pip install yfinance）")
+        raise SystemExit("yfinance 未安裝")
 
-    resolved = 0
-    ge3 = ge5 = 0
+    usable = ge3 = ge5 = 0
     yrs_list = []
-    print("{:14} {:14} {:>5} {:>7}  {}".format("ISIN", "→ 符號", "年數", "筆數", "名稱"))
-    print("-" * 72)
+    print("{:14} {:12} {:>6} {:>6} {:>5}  {}".format("ISIN", "符號", "來源", "年數", "筆數", "名稱"))
+    print("-" * 76)
     for isin, name in SEED:
-        sym, info = resolve_symbol(isin)
+        quotes, err = search_candidates(isin)
+        if err:
+            print("{:14} {:12} {:>6} {:>6} {:>5}  {}  [{}]".format(isin, "-", "-", "-", "-", name, err))
+            time.sleep(0.6); continue
+        sym, how = pick_symbol(quotes)
         if not sym:
-            print("{:14} {:14} {:>5} {:>7}  {}  [{}]".format(
-                isin, "✗未對到", "-", "-", name, info))
-            time.sleep(0.6)
-            continue
-        resolved += 1
+            cand = ",".join(q.get("symbol", "") for q in quotes[:5]) or "無"
+            print("{:14} {:12} {:>6} {:>6} {:>5}  {}  [候選:{}]".format(
+                isin, "✗", how, "-", "-", name, cand))
+            time.sleep(0.7); continue
         yrs, n, d0, d1 = years_of(sym)
-        yrs_list.append(yrs)
-        if yrs >= 3:
-            ge3 += 1
-        if yrs >= 5:
-            ge5 += 1
-        flag = "✓" if yrs >= 3 else "△"
-        print("{:14} {:14} {:>5} {:>7}  {} {}  ({}~{})".format(
-            isin, sym[:14], yrs, n, flag, name, d0, d1))
-        time.sleep(0.8)
+        if n > 1:
+            usable += 1; yrs_list.append(yrs)
+            if yrs >= 3: ge3 += 1
+            if yrs >= 5: ge5 += 1
+        flag = "✓" if yrs >= 3 else ("·" if n > 1 else "✗")
+        print("{:14} {:12} {:>6} {:>6} {:>5}  {} {} ({}~{})".format(
+            isin, sym[:12], how, yrs, n, flag, name, d0, d1))
+        time.sleep(0.9)
 
-    n = len(SEED)
+    N = len(SEED)
     avg = round(sum(yrs_list) / len(yrs_list), 1) if yrs_list else 0
-    print("=" * 72)
-    print("彙總：{}/{} 對到符號({:.0%})；有資料者 ≥3年 {} 檔、≥5年 {} 檔；平均 {} 年".format(
-        resolved, n, resolved / n, ge3, ge5, avg))
-    print("判讀：≥3年比例高(如 >70%) → yfinance 可撐回測，寫全市場 backfill；"
-          "偏低 → 改晨星或別條源。")
-    print("=" * 72)
+    print("=" * 76)
+    print("彙總：可用(>1筆) {}/{} ({:.0%})；其中 ≥3年 {} 檔、≥5年 {} 檔；可用檔平均 {} 年".format(
+        usable, N, usable / N, ge3, ge5, avg))
+    print("判讀：可用率 >70% 且平均≥4年 → 寫全市場 backfill；仍偏低 → 看失敗候選決定補救")
+    print("=" * 76)
 
 
 if __name__ == "__main__":
