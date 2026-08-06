@@ -1,0 +1,64 @@
+name: 每日補最新 SITCA 淨值
+
+# 方案B：app 部署環境(Streamlit Cloud)的 SITCA POST 被回 404 擋，無法即時抓。
+# 改由 GitHub Actions(已證明能通 SITCA)每天傍晚補最近幾天、commit 進庫，
+# app 讀靜態庫即永遠 ≤1 天新。境內用 SITCA；境外(PENDING#3)未含。
+#
+# 原理：build_sitca.py 的 load_progress 讀 data/sitca_nav*.csv(含 seg 歷史檔)，
+#   會把歷史日期標記為已完成 → 本 job(SEGMENT_TOTAL=1)只抓最近 DAYS_BACK 天、
+#   寫進 data/sitca_nav_{年}.csv(非 seg)。app 的 glob 同時讀 seg 與非 seg 檔。
+
+on:
+  schedule:
+    - cron: '0 13 * * 1-5'   # 週一~五 13:00 UTC = 台北 21:00（境內淨值多已公布）
+  workflow_dispatch:          # 也可手動 Run 測試
+
+permissions:
+  contents: write
+
+# 避免與手動全量建庫同時 push 打架
+concurrency:
+  group: sitca-data-write
+  cancel-in-progress: false
+
+jobs:
+  topup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install requests
+
+      - name: 補最近幾天(境內全市場)
+        env:
+          PYTHONUNBUFFERED: '1'
+          SITCA_COMPANIES: 'ALL'
+          SITCA_DAYS_BACK: '7'      # 只看最近7個營業日；已在庫的自動略過
+          SITCA_SKIP_RECENT: '0'    # 要最新→不跳最近幾天(傍晚跑，今日境內多已公布)
+          SITCA_SLEEP: '1.5'        # 禮貌延遲，避免被 SITCA 丟包
+          SEGMENT_TOTAL: '1'        # 單段→寫 sitca_nav_{年}.csv(非seg)，不動全量seg檔
+          SEGMENT_INDEX: '0'
+          SITCA_TIME_BUDGET: '25'
+          SITCA_FAIL_STREAK: '6'    # 連續6逾時→中止(斷路器)，不硬撞30分
+        run: python -u build_sitca.py
+
+      - name: 提交回 repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --staged --quiet; then
+            echo "無新資料（假日或今日淨值尚未公布）"
+          else
+            git commit -m "每日補最新: SITCA 境內 ($(date -u +%Y-%m-%d))"
+            # 防與其他 workflow 併發 push：先 rebase 再 push，最多試5次
+            for i in 1 2 3 4 5; do
+              git pull --rebase origin main && git push && break
+              echo "push衝突，第 $i 次重試…"; sleep $((RANDOM % 10 + 5))
+            done
+          fi
