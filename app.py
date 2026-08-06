@@ -289,12 +289,16 @@ def fetch_sitca_nav(company: str, date_str: str) -> Tuple[List[dict], str]:
             return [], "① 抓不到 __VIEWSTATE（頁面結構可能改版）"
         date_name, company_name = _sitca_detect_fields(html)
 
+        # ★ ALL 模式：公司下拉「所有公司」的真實 value 是空字串 ""，不是 "ALL"。
+        #   送 "ALL" 會被 SITCA 視為非法值（真瀏覽器不會送）→ WAF 回 404（實測）。
+        #   與建庫版 build_sitca.py 的 fetch_one 對齊。
+        comp_value = "" if str(company).upper() in ("", "ALL") else company
         payload = {
             "__VIEWSTATE": vs,
             "__VIEWSTATEGENERATOR": vsg,
             "__EVENTVALIDATION": ev,
             date_name: date_str,
-            company_name: company,
+            company_name: comp_value,
         }
         for btn in ["ctl00$ContentPlaceHolder1$btnQuery",
                     "ctl00$ContentPlaceHolder1$BtnQuery",
