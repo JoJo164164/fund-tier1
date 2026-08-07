@@ -1,82 +1,112 @@
 # -*- coding: utf-8 -*-
-"""cnyes 探針 v2：找「一次給全部淨值」的端點 + 確認 8374 是否全境外
+"""cnyes 探針 v3（決定性）：cnyes 0P 代碼 → yfinance 的真實涵蓋率
 =====================================================
-關鍵：table 端點鎖10筆/頁→全市場逐頁翻不可行。
-     圖表通常一次載完整序列→找出那個端點，一檔一請求，全市場才做得起來。
+發現：cnyes metadata 有 fundClassId(=Yahoo 0P) + isin + sitca(空=境外)。
+驗證：① 清單能否直接帶 fundClassId/isin/sitca ② sitca 是否=境內外篩法
+     ③ 用 cnyes 給的 0P 丟 yfinance，真實涵蓋率與歷史年數(定案關鍵)
 """
 import json
+import time
 import requests
+try:
+    import yfinance as yf
+    HAS = True
+except ImportError:
+    HAS = False
 
 H = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
      "Origin": "https://fund.cnyes.com", "Referer": "https://fund.cnyes.com/"}
 BASE = "https://fund.api.cnyes.com/fund/api"
-CODE = "B4AY7PY"   # total 應=1233
+LIST = BASE + "/v2/search/fund"
 
 
-def try_url(label, url, params=None):
+def meta(code):
+    """單檔 metadata：抓 fundClassId(0P)/isin/sitca。"""
     try:
-        r = requests.get(url, params=params or {}, headers=H, timeout=30)
-        ct = r.headers.get("content-type", "")
-        n = "-"
-        try:
-            j = r.json()
-            # 嘗試數出點數
-            for path in [("items", "data"), ("data",), ("items",)]:
-                cur = j
-                ok = True
-                for k in path:
-                    if isinstance(cur, dict) and k in cur:
-                        cur = cur[k]
-                    else:
-                        ok = False; break
-                if ok and isinstance(cur, list):
-                    n = len(cur); break
-            preview = json.dumps(j, ensure_ascii=False)[:160]
-        except Exception:
-            preview = r.text[:160]
-        print("[{}] HTTP {} | 點數={} | {}\n     {}\n".format(
-            label, r.status_code, n, ct, preview))
-    except Exception as e:
-        print("[{}] 例外 {}: {}\n".format(label, type(e).__name__, str(e)[:80]))
+        r = requests.get(BASE + "/v1/funds/{}/nav".format(code), headers=H, timeout=20)
+        it = r.json().get("items", {})
+        return it if isinstance(it, dict) else {}
+    except Exception:
+        return {}
+
+
+def yfyears(sym):
+    try:
+        df = yf.Ticker(sym).history(period="max", auto_adjust=True)
+        if df is None or len(df) == 0:
+            return 0, 0
+        idx = df.index
+        return round((idx.max() - idx.min()).days / 365.25, 1), len(df)
+    except Exception:
+        return 0, 0
 
 
 def main():
     print("=" * 72)
-    print("A. 找『一次給全部』的淨值端點（目標：一次回 ~1233 筆，非 10 筆）")
+    print("① 清單能否直接帶 fundClassId/isin/sitca？")
     print("=" * 72)
-    nav = BASE + "/v1/funds/{}/nav".format(CODE)
-    try_url("format=chart", nav, {"format": "chart"})
-    try_url("format=daily", nav, {"format": "daily"})
-    try_url("format=json", nav, {"format": "json"})
-    try_url("no format", nav, {})
-    try_url("chart&range=all", nav, {"format": "chart", "range": "all"})
-    # 可能的圖表專用路徑
-    for p in ["/v1/funds/{}/nav-chart", "/v1/funds/{}/chart",
-              "/v1/funds/{}/performance", "/v2/funds/{}/nav", "/v1/funds/{}/nav-history"]:
-        u = BASE + p.format(CODE)
-        try_url("path " + p.split("funds/{}")[1], u, {})
+    fields = ("cnyesId,fundYesId,fundClassId,isin,sitca,displayNameLocal,"
+              "investmentArea,classCurrencyLocal,inceptionDate,forSale")
+    r = requests.get(LIST, params={"order": "priceDate", "sort": "desc", "page": 1,
+                     "institutional": 0, "fields": fields}, headers=H, timeout=30)
+    data = (r.json().get("items", {}) or {}).get("data", []) or []
+    list_has_0p = any(d.get("fundClassId") for d in data)
+    for d in data[:3]:
+        print("  ", json.dumps(d, ensure_ascii=False))
+    print("→ 清單直接帶 fundClassId：", list_has_0p)
 
+    print("\n" + "=" * 72)
+    print("②③ 抽樣 25 檔：classify(sitca) + cnyes 0P → yfinance 年數  yf可用:", HAS)
     print("=" * 72)
-    print("B. 確認 8374 檔是不是全境外（抽 3 頁看基金品牌）")
+    # 抽跨頁樣本
+    sample = []
+    for pg in [1, 100, 250, 400]:
+        rr = requests.get(LIST, params={"order": "priceDate", "sort": "desc", "page": pg,
+                          "institutional": 0, "fields": fields}, headers=H, timeout=30)
+        sample += (rr.json().get("items", {}) or {}).get("data", []) or []
+        time.sleep(0.3)
+    sample = sample[:25]
+
+    offshore = onshore = with0p = usable = 0
+    yrs_list = []
+    print("{:10} {:8} {:14} {:>5} {:>6}  {}".format("cnyesId", "境內外", "0P碼", "年數", "筆數", "名稱"))
+    print("-" * 72)
+    for d in sample:
+        code = (d.get("cnyesId") or "").replace(",", "")
+        fc = d.get("fundClassId")
+        sitca = d.get("sitca")
+        isin = d.get("isin")
+        # 清單沒帶就補抓 metadata
+        if fc is None and sitca is None and isin is None:
+            m = meta(code)
+            fc = m.get("fundClassId"); sitca = m.get("sitca"); isin = m.get("isin")
+            time.sleep(0.3)
+        is_off = (not sitca)   # sitca 空 → 境外
+        if is_off:
+            offshore += 1
+        else:
+            onshore += 1
+        if fc:
+            with0p += 1
+        yy = nn = 0
+        if is_off and fc and HAS:
+            yy, nn = yfyears(fc)
+            if nn > 1:
+                usable += 1; yrs_list.append(yy)
+            time.sleep(0.7)
+        tag = "境外" if is_off else "境內(sitca=%s)" % sitca
+        print("{:10} {:8} {:14} {:>5} {:>6}  {}".format(
+            code, "境外" if is_off else "境內", (fc or "-")[:14], yy, nn,
+            (d.get("displayNameLocal") or "")[:24]))
+
+    N = len(sample)
+    avg = round(sum(yrs_list) / len(yrs_list), 1) if yrs_list else 0
     print("=" * 72)
-    LIST = BASE + "/v2/search/fund"
-    fields = "cnyesId,fundYesId,displayNameLocal,investmentArea,inceptionDate,forSale"
-    for pg in [1, 200, 419]:
-        try:
-            r = requests.get(LIST, params={"order": "priceDate", "sort": "desc",
-                             "page": pg, "institutional": 0, "fields": fields},
-                             headers=H, timeout=30)
-            data = (r.json().get("items", {}) or {}).get("data", []) or []
-            names = [d.get("displayNameLocal", "")[:22] for d in data[:6]]
-            print("第{}頁前6檔：".format(pg))
-            for nm in names:
-                print("   ", nm)
-        except Exception as e:
-            print("第{}頁失敗：{}".format(pg, e))
-    # 有沒有明顯的台灣境內基金(元大/國泰/富邦/群益…投信)
-    print("\n若上面全是外資品牌(景順/施羅德/富坦/貝萊德…)→ 8374=境外，免篩選")
-    print("若混到 元大/國泰/富邦/群益/統一…台灣投信 → 需再找境內外篩法")
+    print("樣本 {}：境外 {}、境內 {}；有0P碼 {}；境外中 yfinance 可用 {}、平均 {} 年".format(
+        N, offshore, onshore, with0p, usable, avg))
+    print("定案判讀：境外可用率 = usable / offshore。>70% → cnyes清單0P→yfinance 全市場建庫")
+    print("=" * 72)
 
 
 if __name__ == "__main__":
