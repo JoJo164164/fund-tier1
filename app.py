@@ -386,9 +386,19 @@ def load_history_db(max_years: Optional[int] = None) -> Tuple[pd.DataFrame, str]
     if n_sitca:
         src_msg.append("境內{}年檔({:,}筆)".format(len(sitca_files), n_sitca))
 
-    # ── 境外 ──
+    # ── 境外（分年檔，glob 一起讀；避免單檔超過 GitHub 100MB）──
     try:
-        df = pd.read_csv(HIST_OFFSHORE, dtype=str)
+        import glob as _glob
+        off_files = sorted(_glob.glob("data/offshore_nav_*.csv"))
+        if not off_files and os.path.exists(HIST_OFFSHORE):
+            off_files = [HIST_OFFSHORE]        # 相容舊單檔
+        off_frames = []
+        for _f in off_files:
+            try:
+                off_frames.append(pd.read_csv(_f, dtype=str))
+            except Exception:
+                pass
+        df = pd.concat(off_frames, ignore_index=True) if off_frames else pd.DataFrame()
         if len(df) > 0:
             df["淨值"] = pd.to_numeric(df["淨值"], errors="coerce")
             df = df.dropna(subset=["淨值"])
@@ -399,7 +409,7 @@ def load_history_db(max_years: Optional[int] = None) -> Tuple[pd.DataFrame, str]
                     df[c] = "未分類"
             frames.append(df[["代碼", "日期", "淨值", "名稱", "境內外", "發行",
                               "資產類型", "投資區域"]])
-            src_msg.append("境外({:,}筆)".format(len(df)))
+            src_msg.append("境外{}年檔({:,}筆)".format(len(off_files), len(df)))
     except FileNotFoundError:
         pass
     except Exception:
