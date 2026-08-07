@@ -1,0 +1,113 @@
+name: 建置 境外基金淨值庫 (cnyes+yfinance)
+
+# 境外全市場建庫：cnyes 清單拿全境外 0P 代碼 → yfinance 抓 max 長歷史(含後綴救援)。
+# prepare(列清單) → build(平行分段 yfinance) → merge(合併+commit)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      parallel:
+        description: '平行分段數(1-20)。~5000檔境外，10段約20分'
+        required: true
+        default: '10'
+      sleep:
+        description: '每檔 yfinance 間隔秒'
+        required: true
+        default: '0.5'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: offshore-data-write
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      segments: ${{ steps.gen.outputs.segments }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests
+      - name: 列出全境外清單
+        env:
+          OFFSHORE_MODE: enumerate
+        run: python -u build_offshore.py
+      - name: 上傳清單
+        uses: actions/upload-artifact@v4
+        with:
+          name: offshore-universe
+          path: data/offshore_universe.csv
+          retention-days: 1
+      - id: gen
+        run: |
+          N=${{ github.event.inputs.parallel }}
+          echo "segments=$(python3 -c "print([i for i in range($N)])")" >> $GITHUB_OUTPUT
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        segment: ${{ fromJson(needs.prepare.outputs.segments) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests yfinance
+      - uses: actions/download-artifact@v4
+        with:
+          name: offshore-universe
+          path: data
+      - name: 抓本段歷史(第${{ matrix.segment }}段)
+        env:
+          PYTHONUNBUFFERED: '1'
+          OFFSHORE_MODE: fetch
+          SEGMENT_TOTAL: ${{ github.event.inputs.parallel }}
+          SEGMENT_INDEX: ${{ matrix.segment }}
+          OFFSHORE_SLEEP: ${{ github.event.inputs.sleep }}
+        run: python -u build_offshore.py
+      - name: 上傳本段
+        uses: actions/upload-artifact@v4
+        with:
+          name: seg-${{ matrix.segment }}
+          path: data/offshore_nav_seg*.csv
+          retention-days: 1
+
+  merge:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: _segs
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests
+      - name: 合併分段 → offshore_nav.csv
+        run: python3 merge_offshore.py
+      - name: 提交回 repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/offshore_nav.csv
+          if git diff --staged --quiet; then
+            echo "無變更"
+          else
+            git commit -m "境外建庫: cnyes+yfinance ($(date -u +%Y-%m-%d))"
+            for i in 1 2 3 4 5; do
+              git pull --rebase origin main && git push && break
+              sleep $((RANDOM % 10 + 5))
+            done
+          fi
