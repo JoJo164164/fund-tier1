@@ -1,44 +1,24 @@
 # -*- coding: utf-8 -*-
+"""境外基金淨值建庫（cnyes 清單 → yfinance 長歷史 backfill）
+=====================================================
+定案架構（免費源實測最佳解）：
+  清單源：cnyes v2/search/fund → 全市場基金，含 fundClassId(=Yahoo 0P)、isin、
+          sitca(空=境外)、名稱、投資區域、幣別。用 sitca=="" 篩境外。
+  歷史源：yfinance 抓 fundClassId(0P) 的 max 歷史。非美元類股 0P 裸碼常無資料，
+          故「先試裸 0P、再試 .F/.SG/.DE/.MU 等交易所後綴」救援，最大化涵蓋率。
+輸出：data/offshore_nav.csv（代碼,日期,淨值,幣別,名稱,來源,資產類型,投資區域）
+      代碼=cnyesId(去逗號)；日期 ISO 對齊境內。
+
+模式（環境變數 OFFSHORE_MODE）：
+  enumerate → 只抓 cnyes 全境外清單，寫 data/offshore_universe.csv（prepare 用）
+  fetch     → 讀 universe，做本段(SEGMENT_INDEX)的 yfinance backfill，寫 seg 檔
+分段：SEGMENT_TOTAL / SEGMENT_INDEX（比照境內，按基金 index 間隔切）。
 """
-境外基金雙源容錯建庫腳本（GitHub Actions 版）
-================================================
-依《台灣基金滾動跌幅系統 — 專案憲法 v3》。
-
-雙源策略（自動容錯，不押寶單一來源）：
-  ① 優先 yfinance 0P 代碼（乾淨、跟 ETF 同管線、有 15 年歷史者直接用）
-  ② 抓不到/歷史太短者，fallback 到 MoneyDJ（清單全、中文名全）
-  每檔標記「來源 + 抓到幾年」，讓資料自己顯示真實覆蓋率，不靠事前猜測。
-
-對應憲法：
-  鐵律11 範圍不可縮減（境外基金必抓）
-  鐵律13 sandbox 無網路 → 連線由 Actions 實跑；本地只驗邏輯
-  鐵律16 淨值截至日：每筆記錄實際日期，不對齊
-  「抓當下最新NAV、是哪天算哪天、標日期」（使用者裁決）
-
-環境變數（workflow 傳入）：
-  OFFSHORE_SOURCE   'yfinance' | 'moneydj' | 'both'（預設 both）
-  OFFSHORE_CODES    逗號分隔要抓的代碼（驗證用；空=用內建測試清單）
-  OFFSHORE_YEARS    抓幾年歷史（預設 15）
-  TIME_BUDGET_MIN   本次最多跑幾分鐘（預設 300）
-
-輸出：
-  data/offshore_nav.csv       淨值長表
-  data/offshore_progress.json 斷點續傳
-  data/offshore_coverage.csv  每檔覆蓋率報告（來源/起訖/年數）— 讓你看真實覆蓋
-"""
-
 import os
-import re
 import csv
-import json
 import time
-import datetime as dt
 
-try:
-    import requests
-except ImportError:
-    raise SystemExit("需要 requests（workflow 會 pip install）")
-
+import requests
 try:
     import yfinance as yf
     _HAS_YF = True
@@ -46,422 +26,147 @@ except ImportError:
     _HAS_YF = False
 
 DATA_DIR = "data"
-NAV_CSV = os.path.join(DATA_DIR, "offshore_nav.csv")
-PROGRESS = os.path.join(DATA_DIR, "offshore_progress.json")
-COVERAGE_CSV = os.path.join(DATA_DIR, "offshore_coverage.csv")
-NAV_COLS = ["代碼", "日期", "淨值", "幣別", "名稱", "來源"]
-COV_COLS = ["代碼", "名稱", "來源", "資料起", "資料截至", "年數", "筆數", "狀態"]
+UNIVERSE_CSV = os.path.join(DATA_DIR, "offshore_universe.csv")
+NAV_COLS = ["代碼", "日期", "淨值", "幣別", "名稱", "來源", "資產類型", "投資區域"]
+UNI_COLS = ["代碼", "0P", "isin", "名稱", "幣別", "投資區域", "資產類型"]
 
-YEARS = int(os.environ.get("OFFSHORE_YEARS", "15"))
-TIME_BUDGET_MIN = int(os.environ.get("TIME_BUDGET_MIN", "300"))
-SOURCE = os.environ.get("OFFSHORE_SOURCE", "both").lower()
-SLEEP = float(os.environ.get("OFFSHORE_SLEEP", "1.0"))
+LIST = "https://fund.api.cnyes.com/fund/api/v2/search/fund"
+H = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+     "Origin": "https://fund.cnyes.com", "Referer": "https://fund.cnyes.com/"}
+FIELDS = ("cnyesId,fundClassId,isin,sitca,displayNameLocal,investmentArea,"
+          "classCurrencyLocal,categoryAbbr")
 
-# 內建測試清單：知名境外基金的 (yfinance 0P代碼, MoneyDJ代碼, 中文名)
-# 0P 代碼是 Yahoo 給共同基金的專屬前綴（實測 doc86: 0P000019KV = JPM Greater China）
-# 正式建庫時此清單由 MoneyDJ 清單頁 + Yahoo 搜尋自動產生；此處為驗證種子。
-SEED_FUNDS = [
-    {"yf": "0P000019KV", "mdj": "jfzh2", "name": "摩根基金-中國基金A股(美元)(累計)"},
-    {"yf": "",           "mdj": "jfz14", "name": "摩根印度基金"},
-    {"yf": "",           "mdj": "NBTG1", "name": "路博邁NB次世代通訊A累積(南非幣)"},
-    {"yf": "",           "mdj": "FLZ01", "name": "富蘭克林黃金基金美元A"},
-    {"yf": "",           "mdj": "FLZ14", "name": "富蘭克林坦伯頓外國基金A"},
-]
-
-# ── Yahoo 奇摩基金（境外主源：SSR、有「最長」歷史、ID為Morningstar SecId）──
-# 實測：tw.stock.yahoo.com/fund/{ID}/history 為SSR，表格直接在HTML；
-#       頁面有「1個月/3個月/6個月/1年/3年/5年/最長」+「下載歷史報價(日期區間)」
-YH_HIST_URL = "https://tw.stock.yahoo.com/fund/{fid}/history"
-YH_LIST_URL = "https://tw.stock.yahoo.com/fund/offshore/"
-YH_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-
-# 期間參數候選（實跑時自動試，取回傳最多者；不猜死一種）
-YH_PERIOD_PARAMS = [
-    "?period=max", "?range=max", "?period=10y", "?range=10y",
-    "?period=5y", "?range=5y", "",
-]
-
-# 歷史列格式：2026/07/21 → 22.69（SSR純文字）
-_YH_ROW_RE = re.compile(r'(\d{4}/\d{2}/\d{2})\s+([\d,]+\.\d+)')
+MODE = os.environ.get("OFFSHORE_MODE", "fetch")
+SEG_TOTAL = int(os.environ.get("SEGMENT_TOTAL", "1"))
+SEG_INDEX = int(os.environ.get("SEGMENT_INDEX", "0"))
+SLEEP = float(os.environ.get("OFFSHORE_SLEEP", "0.5"))
+SUFFIXES = ["", ".F", ".SG", ".DE", ".MU", ".L", ".SW"]
 
 
-def fetch_yahoo_fund(fid, years=15):
-    """抓 Yahoo 奇摩基金歷史淨值。自動嘗試多種期間參數，取回傳最多的那組。
+def _seg_name(base):
+    return base if SEG_TOTAL <= 1 else base.replace(".csv", "_seg{:02d}.csv".format(SEG_INDEX))
 
-    fid 格式：F00000Q03Y:FO（Morningstar SecId + :FO境外）
-    回傳 (list[(date,nav)], 幣別, 錯誤)
-    """
-    best, best_param = [], None
-    for p in YH_PERIOD_PARAMS:
+
+def classify_asset(name, cat):
+    s = (name or "") + (cat or "")
+    for k, v in [("貨幣", "貨幣市場"), ("債", "債券型"), ("REIT", "股票型"),
+                 ("房地產", "股票型"), ("股票", "股票型"), ("平衡", "平衡型"),
+                 ("多重資產", "平衡型"), ("組合", "組合型")]:
+        if k in s:
+            return v
+    return "未分類"
+
+
+def enumerate_universe():
+    funds, page, last = [], 1, 1
+    while page <= last:
         try:
-            r = requests.get(YH_HIST_URL.format(fid=fid) + p,
-                             headers=YH_HEADERS, timeout=25)
-            if r.status_code != 200:
-                continue
-            rows = _YH_ROW_RE.findall(r.text)
-            out = []
-            for ds, nav in rows:
-                try:
-                    y, m, d = ds.split("/")
-                    out.append(("{}-{}-{}".format(y, m, d), float(nav.replace(",", ""))))
-                except Exception:
+            r = requests.get(LIST, params={"order": "priceDate", "sort": "desc",
+                             "page": page, "institutional": 0, "fields": FIELDS},
+                             headers=H, timeout=30)
+            it = r.json().get("items", {}) or {}
+            last = it.get("last_page", 1) or 1
+            for d in it.get("data", []) or []:
+                if d.get("sitca"):
                     continue
-            # 去重（同頁可能重複出現）
-            out = sorted(set(out))
-            if len(out) > len(best):
-                best, best_param = out, p
-            # 已拿到夠長歷史就不用再試
-            if len(best) > 250 * min(years, 3):
-                break
-            time.sleep(0.2)
-        except Exception:
-            continue
-    if not best:
-        return [], "", "yahoo無資料"
-    return best, "", None if best_param is None else None
+                code = (d.get("cnyesId") or "").replace(",", "")
+                if not code:
+                    continue
+                funds.append({
+                    "代碼": code, "0P": d.get("fundClassId") or "",
+                    "isin": d.get("isin") or "",
+                    "名稱": (d.get("displayNameLocal") or "")[:50],
+                    "幣別": d.get("classCurrencyLocal") or "",
+                    "投資區域": d.get("investmentArea") or "未分類",
+                    "資產類型": classify_asset(d.get("displayNameLocal"), d.get("categoryAbbr")),
+                })
+        except Exception as e:
+            print("  第{}頁失敗：{}".format(page, e))
+        if page % 20 == 0:
+            print("  已掃 {}/{} 頁，累計境外 {} 檔".format(page, last, len(funds)))
+        page += 1
+        time.sleep(0.25)
+    return funds
 
 
-def fetch_yahoo_offshore_list(max_pages=40):
-    """抓 Yahoo 全市場基金清單。
+def write_universe(funds):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(UNIVERSE_CSV, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=UNI_COLS)
+        w.writeheader()
+        for x in funds:
+            w.writerow(x)
+    print("→ 寫入 {}：{} 檔境外".format(UNIVERSE_CSV, len(funds)))
 
-    ★ 設計原則：**不猜參數，讓程式自己試出哪組有效**（沙盒無法驗證URL參數，
-      因為 web_fetch 會跟隨 canonical 把 query string 丟掉）。
 
-    已知事實（實測）：
-      - /fund/search  是基金篩選頁，預設條件「三個月5%以上」→ 238筆，SSR
-      - /fund/offshore 是境外基金**搜尋**頁，無關鍵字時回「沒有符合 "" 的搜尋結果」
-      - 每檔連結格式 /fund/{SecId}:FO/summary；:FO 是所有基金的後綴，**不分境內外**
+def read_universe():
+    with open(UNIVERSE_CSV, encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f))
 
-    策略：
-      ① 先用少量探針關鍵字 × 多組參數名，偵測哪組真的會改變結果
-      ② 偵測到有效組合 → 全關鍵字窮舉
-      ③ 都無效 → 至少收下預設清單（並在 log 明講，讓使用者知道覆蓋率有限）
-    """
-    found = {}
-    id_re = re.compile(r'/fund/([A-Z0-9]{8,12}:FO)')
-    bases = ["https://tw.stock.yahoo.com/fund/offshore",
-             "https://tw.stock.yahoo.com/fund/search"]
-    param_names = ["keyword", "q", "query", "name", "searchTerm"]
 
-    def _ids(url):
+def yf_history(op):
+    if not op or not _HAS_YF:
+        return [], ""
+    for suf in SUFFIXES:
+        sym = op + suf
         try:
-            r = requests.get(url, headers=YH_HEADERS, timeout=25)
-            if r.status_code != 200:
-                return set()
-            return set(id_re.findall(r.text))
-        except Exception:
-            return set()
-
-    # ── ① 偵測有效的 (base, param) 組合 ──
-    probes = ["摩根", "貝萊德", "聯博"]
-    combo = None
-    print("  【偵測有效參數組合】")
-    for base in bases:
-        baseline = _ids(base)          # 不帶參數時的結果
-        for pname in param_names:
-            sets = [_ids("{}?{}={}".format(base, pname, kw)) for kw in probes]
-            # 有效判準：不同關鍵字要回不同結果，且至少一組跟 baseline 不同
-            distinct = len({frozenset(s) for s in sets if s})
-            differs = any(s and s != baseline for s in sets)
-            if distinct >= 2 and differs:
-                combo = (base, pname)
-                print("    ✓ 有效：{}?{}=  (探針回傳 {} 種不同結果)".format(
-                    base.split("/")[-1], pname, distinct))
-                break
-            time.sleep(0.2)
-        if combo:
-            break
-        # 無效也先把 baseline 收下
-        found.update({i: i for i in baseline})
-
-    # ── ② 有效 → 全窮舉；無效 → 只能用預設清單 ──
-    if combo:
-        base, pname = combo
-        keywords = [
-            "摩根", "貝萊德", "富達", "聯博", "施羅德", "安聯", "富蘭克林", "景順",
-            "百達", "瑞銀", "法巴", "駿利", "高盛", "荷寶", "安本", "先機", "利安",
-            "晉達", "天達", "霸菱", "鋒裕", "路博邁", "宏利", "瀚亞", "野村", "柏瑞",
-            "東方匯理", "德意志", "品浩", "美盛", "PIMCO", "NN", "AXA", "保德信",
-            "元大", "國泰", "群益", "統一", "復華", "富邦", "永豐", "台新", "中國信託",
-            "第一金", "兆豐", "華南永昌", "玉山", "凱基", "日盛", "合庫", "聯邦",
-            "滙豐", "匯豐", "台中銀", "大華銀", "街口", "德銀遠東", "康和", "宏遠",
-            "中國", "美國", "日本", "印度", "歐洲", "全球", "環球", "亞洲", "新興",
-            "台灣", "越南", "韓國", "拉丁", "科技", "醫療", "生技", "能源", "金融",
-            "房地產", "基建", "資源", "黃金", "高收益", "投資級", "政府債", "公司債",
-            "平衡", "多重資產", "收益", "成長", "價值", "貨幣", "組合", "永續",
-            "股票", "債券", "A股", "亞太", "東協", "北美", "德國", "英國",
-        ]
-        print("  【全市場窮舉】{} 組關鍵字 × 分頁".format(len(keywords)))
-        for kw in keywords:
-            got = 0
-            for page in range(1, 11):
-                url = "{}?{}={}&page={}".format(base, pname, kw, page)
-                new = _ids(url) - set(found)
-                if not new:
-                    break
-                found.update({i: i for i in new})
-                got += len(new)
-                time.sleep(0.2)
-            if got:
-                print("    [{}] +{} → 累計 {}".format(kw, got, len(found)))
-    else:
-        print("  ⚠️ 所有參數組合皆無效（Yahoo 可能改為純前端篩選）")
-        print("     → 僅能取得預設清單 {} 檔，將由 MoneyDJ 清單補足".format(len(found)))
-
-    print("  Yahoo 清單合計：{} 檔".format(len(found)))
-    return list(found.keys())
-
-
-# ── MoneyDJ 抓取（Big5、傳統server頁，已實測可抓30日淨值）──
-MDJ_NAV_URL = "https://www.moneydj.com/funddj/ya/yp010001.djhtm?a={code}"
-MDJ_LIST_URL = "https://www.moneydj.com/funddj/ya/yp081001.djhtm"
-MDJ_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-
-# 清單頁每檔連結格式：yp010001.djhtm?a={代碼}（實測含 NBTG1/ALZM9/SHZ19/FTZF9…）
-_MDJ_CODE_RE = re.compile(r'yp010001\.djhtm\?a=([A-Za-z0-9]+)')
-
-
-def fetch_moneydj_list(max_pages=30):
-    """抓 MoneyDJ 境外基金全清單。
-
-    ★ 修正（實測）：`?a=` 是**公司代碼**不是頁碼（原以為分頁 → 只抓到首頁100檔）。
-      改為：先從首頁抓所有公司連結，再逐家抓該公司的基金列表。
-    """
-    found = {}
-    # ① 先抓首頁（預設列出部分基金 + 公司連結）
-    try:
-        r = requests.get(MDJ_LIST_URL, headers=MDJ_HEADERS, timeout=25)
-        r.encoding = "big5"
-        html = r.text
-        for c in _MDJ_CODE_RE.findall(html):
-            found.setdefault(c, c)
-        # 公司代碼：yp081001.djhtm?a=XXX 這類連結
-        comp_re = re.compile(r'yp081001\.djhtm\?a=([A-Za-z0-9]+)')
-        comps = sorted(set(comp_re.findall(html)))
-        print("  MoneyDJ 首頁 → {} 檔基金、{} 家公司".format(len(found), len(comps)))
-    except Exception as e:
-        print("  MoneyDJ 首頁失敗:", type(e).__name__)
-        return [(k, v) for k, v in found.items()]
-
-    # ② 逐家公司抓其基金列表
-    for i, comp in enumerate(comps[:max_pages]):
-        try:
-            r = requests.get("{}?a={}".format(MDJ_LIST_URL, comp),
-                             headers=MDJ_HEADERS, timeout=25)
-            r.encoding = "big5"
-            new = 0
-            for c in _MDJ_CODE_RE.findall(r.text):
-                if c not in found:
-                    found[c] = c
-                    new += 1
-            if new:
-                print("  MoneyDJ 公司[{}] → 新增 {}（累計 {}）".format(comp, new, len(found)))
-            time.sleep(0.3)
-        except Exception:
-            continue
-    return [(k, v) for k, v in found.items()]
-
-
-def fetch_moneydj(code):
-    """抓 MoneyDJ 單檔淨值（最近30日）。回傳 (list[(date,nav)], 幣別, 錯誤)。
-
-    已實測（憲法）：yp010001 頁含「最近30日淨值」表，格式 MM/DD → 淨值。
-    Big5 編碼，數字不受影響。
-    """
-    try:
-        r = requests.get(MDJ_NAV_URL.format(code=code), headers=MDJ_HEADERS, timeout=20)
-        r.encoding = "big5"
-        html = r.text
-        # 抓「最近30日淨值」表：MM/DD 後接淨值
-        rows = re.findall(r'(\d{2}/\d{2})\s*</td>\s*<td[^>]*>\s*([\d,]+\.\d+)', html)
-        if not rows:
-            # 寬鬆 fallback：任何 MM/DD + 數字組合
-            rows = re.findall(r'>(\d{2}/\d{2})<[^>]*>[^0-9]*([\d,]+\.\d{2,4})<', html)
-        out = []
-        year = dt.date.today().year
-        for md, nav in rows:
-            try:
-                mm, dd = md.split("/")
-                # 跨年處理：若月份大於本月，視為去年
-                y = year if int(mm) <= dt.date.today().month else year - 1
-                d = dt.date(y, int(mm), int(dd))
-                out.append((d.isoformat(), float(nav.replace(",", ""))))
-            except Exception:
-                continue
-        cur_m = re.search(r'(TWD|USD|EUR|JPY|新[臺台]幣|美元|歐元|日[圓元])', html)
-        cur = cur_m.group(1) if cur_m else ""
-        return out, cur, None
-    except Exception as e:
-        return [], "", "{}: {}".format(type(e).__name__, e)
-
-
-def fetch_yfinance(code, years):
-    """抓 yfinance 0P 代碼歷史淨值。回傳 (list[(date,nav)], 幣別, 錯誤)。"""
-    if not _HAS_YF or not code:
-        return [], "", "no yf code"
-    try:
-        t = yf.Ticker(code)
-        df = t.history(period="{}y".format(years), auto_adjust=True)
-        if df is None or len(df) == 0:
-            return [], "", "empty"
-        cur = ""
-        try:
-            cur = t.fast_info.get("currency", "") or ""
+            df = yf.Ticker(sym).history(period="max", auto_adjust=True)
+            if df is not None and len(df) > 1:
+                out = []
+                for idx, row in df.iterrows():
+                    c = row.get("Close")
+                    if c == c and c:
+                        out.append((idx.strftime("%Y-%m-%d"), float(c)))
+                if out:
+                    return out, sym
         except Exception:
             pass
-        out = [(idx.strftime("%Y-%m-%d"), float(row["Close"]))
-               for idx, row in df.iterrows() if row["Close"] == row["Close"]]
-        return out, cur, None
-    except Exception as e:
-        return [], "", "{}: {}".format(type(e).__name__, e)
+        time.sleep(0.2)
+    return [], ""
 
 
-def load_progress():
-    try:
-        with open(PROGRESS, encoding="utf-8") as f:
-            return set(json.load(f))
-    except Exception:
-        return set()
-
-
-def save_progress(done):
+def fetch_segment():
+    uni = read_universe()
+    mine = [f for i, f in enumerate(uni) if i % SEG_TOTAL == SEG_INDEX]
+    print("本段 {}/{}：負責 {} / 全 {} 檔".format(SEG_INDEX, SEG_TOTAL, len(mine), len(uni)))
+    out_path = _seg_name(os.path.join(DATA_DIR, "offshore_nav.csv"))
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(PROGRESS, "w", encoding="utf-8") as f:
-        json.dump(sorted(done), f, ensure_ascii=False)
-
-
-def append_nav(records):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    exists = os.path.exists(NAV_CSV)
-    with open(NAV_CSV, "a", encoding="utf-8-sig", newline="") as f:
+    ok, total_rows = 0, 0
+    with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.DictWriter(f, fieldnames=NAV_COLS)
-        if not exists:
-            w.writeheader()
-        for r in records:
-            w.writerow(r)
-
-
-def append_coverage(row):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    exists = os.path.exists(COVERAGE_CSV)
-    with open(COVERAGE_CSV, "a", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=COV_COLS)
-        if not exists:
-            w.writeheader()
-        w.writerow(row)
-
-
-def build_one(fund):
-    """對單檔基金執行三源容錯抓取（Yahoo奇摩 → yfinance → MoneyDJ）。
-
-    優先序理由（憲法v4實測）：
-      ① Yahoo奇摩基金：SSR、有「最長」歷史、ID即Morningstar SecId → 回測需要的長歷史
-      ② yfinance 0P代碼：同源Yahoo，覆蓋率待實測
-      ③ MoneyDJ：只有30天，當最後補網
-    """
-    name = fund["name"]
-    series, cur, src, err = [], "", "", ""
-
-    # ① Yahoo 奇摩基金（境外長歷史主源）
-    if SOURCE in ("yahoo", "both") and fund.get("yh"):
-        series, cur, err = fetch_yahoo_fund(fund["yh"], YEARS)
-        if series:
-            src = "yahoo"
-
-    # ② yfinance
-    if not series and SOURCE in ("yfinance", "both") and fund.get("yf"):
-        series, cur, err = fetch_yfinance(fund["yf"], YEARS)
-        if series:
-            src = "yfinance"
-
-    # ③ MoneyDJ（30天，補網）
-    if not series and SOURCE in ("moneydj", "both") and fund.get("mdj"):
-        series, cur, err2 = fetch_moneydj(fund["mdj"])
-        if series:
-            src = "moneydj"
-        else:
-            err = "yh/yf:{} | mdj:{}".format(err, err2)
-
-    code_id = fund.get("yh") or fund.get("yf") or fund.get("mdj")
-    if not series:
-        return [], {"代碼": code_id, "名稱": name, "來源": "無",
-                    "資料起": "", "資料截至": "", "年數": 0, "筆數": 0,
-                    "狀態": "✗ 三源皆失敗: {}".format(err)}
-
-    dates = [d for d, _ in series]
-    yrs = round((dt.date.fromisoformat(max(dates)) - dt.date.fromisoformat(min(dates))).days / 365.25, 1)
-    recs = [{"代碼": code_id, "日期": d, "淨值": v, "幣別": cur, "名稱": name[:40], "來源": src}
-            for d, v in series]
-    cov = {"代碼": code_id, "名稱": name[:40], "來源": src,
-           "資料起": min(dates), "資料截至": max(dates), "年數": yrs,
-           "筆數": len(series), "狀態": "✓"}
-    return recs, cov
+        w.writeheader()
+        for n, fund in enumerate(mine):
+            rows, sym = yf_history(fund["0P"])
+            if rows:
+                ok += 1
+                for iso, nav in rows:
+                    w.writerow({"代碼": fund["代碼"], "日期": iso, "淨值": nav,
+                                "幣別": fund["幣別"], "名稱": fund["名稱"],
+                                "來源": "yfinance", "資產類型": fund["資產類型"],
+                                "投資區域": fund["投資區域"]})
+                total_rows += len(rows)
+            if (n + 1) % 50 == 0:
+                print("  進度 {}/{}：命中 {} 檔、{:,} 筆".format(n + 1, len(mine), ok, total_rows))
+            time.sleep(SLEEP)
+    cov = ok / len(mine) if mine else 0
+    print("=" * 60)
+    print("本段完成：{}/{} 檔有歷史（{:.0%}）、共 {:,} 筆 → {}".format(
+        ok, len(mine), cov, total_rows, out_path))
+    print("=" * 60)
 
 
 def main():
-    codes_env = os.environ.get("OFFSHORE_CODES", "").strip()
-    if codes_env.upper() == "ALL":
-        # ★ 全市場：優先用 Yahoo 奇摩清單（該源有長歷史），MoneyDJ 當補充
-        print("【全市場模式】抓取境外基金清單…")
-        yh_ids = fetch_yahoo_offshore_list()
-        funds = [{"yh": i, "yf": "", "mdj": "", "name": i} for i in yh_ids]
-        print("Yahoo清單：{} 檔".format(len(yh_ids)))
-        if len(yh_ids) < 50:  # Yahoo清單抓太少 → 補 MoneyDJ
-            print("Yahoo清單偏少，補抓 MoneyDJ 清單…")
-            for c, n in fetch_moneydj_list():
-                funds.append({"yh": "", "yf": "", "mdj": c, "name": n})
-        print("清單合計：{} 檔\n".format(len(funds)))
-    elif codes_env:
-        funds = [{"yh": c if c.endswith(":FO") else "",
-                  "yf": c if c.startswith("0P") else "",
-                  "mdj": c if (not c.startswith("0P") and not c.endswith(":FO")) else "",
-                  "name": c} for c in codes_env.split(",")]
+    print("境外建庫  MODE={} SEG={}/{}  yfinance={}".format(MODE, SEG_INDEX, SEG_TOTAL, _HAS_YF))
+    if MODE == "enumerate":
+        funds = enumerate_universe()
+        if not funds:
+            raise SystemExit("清單抓到 0 檔，cnyes 可能改版")
+        write_universe(funds)
     else:
-        funds = SEED_FUNDS
-
-    print("=" * 60)
-    print("境外雙源建庫  來源模式:", SOURCE, "| 基金數:", len(funds), "| 年數:", YEARS)
-    print("yfinance 可用:", _HAS_YF)
-    print("=" * 60)
-
-    done = load_progress()
-    print("已完成(斷點續傳):", len(done))
-    t0 = time.time()
-    total_new = 0
-
-    for fund in funds:
-        code_id = fund.get("yf") or fund.get("mdj")
-        if code_id in done:
-            continue
-        if (time.time() - t0) / 60 > TIME_BUDGET_MIN:
-            print("⏸ 達時間預算，存檔停止，下次續傳。")
-            break
-
-        recs, cov = build_one(fund)
-        if recs:
-            append_nav(recs)
-            total_new += len(recs)
-        append_coverage(cov)
-        done.add(code_id)
-        save_progress(done)
-        print("  {} {} → [{}] {}筆 {}年".format(
-            cov["狀態"][:1], fund["name"][:24], cov["來源"],
-            cov["筆數"], cov["年數"]))
-        time.sleep(SLEEP)
-
-    print("=" * 60)
-    print("本次新增", total_new, "筆淨值")
-    # 覆蓋率彙總
-    if os.path.exists(COVERAGE_CSV):
-        with open(COVERAGE_CSV, encoding="utf-8-sig") as f:
-            rows = list(csv.DictReader(f))
-        yf_n = sum(1 for r in rows if r["來源"] == "yfinance")
-        mdj_n = sum(1 for r in rows if r["來源"] == "moneydj")
-        fail_n = sum(1 for r in rows if r["來源"] == "無")
-        print("覆蓋率報告: yfinance={} MoneyDJ={} 失敗={} (共{})".format(
-            yf_n, mdj_n, fail_n, len(rows)))
-        print("→ 詳見 data/offshore_coverage.csv（每檔來源/年數）")
-    print("=" * 60)
+        if not _HAS_YF:
+            raise SystemExit("需要 yfinance")
+        fetch_segment()
 
 
 if __name__ == "__main__":
