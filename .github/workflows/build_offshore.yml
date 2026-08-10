@@ -4,6 +4,8 @@ name: 建置 境外基金淨值庫 (cnyes+yfinance)
 # prepare(列清單) → build(平行分段 yfinance) → merge(合併+commit)。
 
 on:
+  schedule:
+    - cron: '0 14 * * 0'   # 每週日 14:00 UTC = 台北週日 22:00（境外NAV有時差，週更足夠）
   workflow_dispatch:
     inputs:
       parallel:
@@ -45,7 +47,7 @@ jobs:
           retention-days: 1
       - id: gen
         run: |
-          N=${{ github.event.inputs.parallel }}
+          N=${{ github.event.inputs.parallel || '10' }}
           echo "segments=$(python3 -c "print([i for i in range($N)])")" >> $GITHUB_OUTPUT
 
   build:
@@ -71,9 +73,9 @@ jobs:
         env:
           PYTHONUNBUFFERED: '1'
           OFFSHORE_MODE: fetch
-          SEGMENT_TOTAL: ${{ github.event.inputs.parallel }}
+          SEGMENT_TOTAL: ${{ github.event.inputs.parallel || '10' }}
           SEGMENT_INDEX: ${{ matrix.segment }}
-          OFFSHORE_SLEEP: ${{ github.event.inputs.sleep }}
+          OFFSHORE_SLEEP: ${{ github.event.inputs.sleep || '0.5' }}
         run: python -u build_offshore.py
       - name: 上傳本段
         uses: actions/upload-artifact@v4
