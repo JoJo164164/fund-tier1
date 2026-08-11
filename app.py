@@ -406,7 +406,10 @@ def load_history_db(max_years: Optional[int] = None) -> Tuple[pd.DataFrame, str]
                 df["淨值"] = pd.to_numeric(df["淨值"], errors="coerce")
                 df = df.dropna(subset=["淨值"])
                 df["境內外"] = "境外"
-                df["發行"] = df["來源"] if "來源" in df.columns else ""
+                # 發行公司：境外用基金名抽出真品牌(取代 yfinance 來源標籤)→篩選下拉+表格一次都對
+                _names = df["名稱"].astype(str)
+                _uniq = {nm: _issuer_from_name(nm) for nm in _names.unique()}
+                df["發行"] = _names.map(_uniq)
                 for c in ["資產類型", "投資區域"]:
                     if c not in df.columns:
                         df[c] = "未分類"
@@ -548,6 +551,11 @@ _OFFSHORE_MGRS = [
     "品浩", "紐約梅隆", "宏利", "富達", "野村", "日盛", "德盛", "先機",
     "鋒裕匯理", "東方匯理", "DWS", "德意志", "羅素", "拉薩德", "美盛",
     "凱利", "GAM", "瑞聯", "安本", "首域", "威靈頓", "英仕曼", "貝萊",
+    # 依官方總代理名單補齊的品牌
+    "匯豐", "瀚亞", "大華銀", "利安資金", "利安", "道富", "先鋒", "木星",
+    "保德信", "PGIM", "貝徠", "鄧普頓", "施瓦茲", "法盛", "晉達", "未來資產",
+    "三星", "安中", "銀聯", "德銀遠東", "德銀", "宏遠", "富盛", "越秀",
+    "鋒裕", "安聯投信",
 ]
 
 
