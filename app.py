@@ -541,14 +541,35 @@ def live_topup_domestic(hist: pd.DataFrame, cap_days: int = LIVE_TOPUP_CAP_DAYS)
     return merged, msg
 
 
+_OFFSHORE_MGRS = [
+    "富蘭克林坦伯頓", "富蘭克林", "富坦", "坦伯頓", "施羅德", "景順", "貝萊德",
+    "摩根士丹利", "摩根", "安聯", "霸菱", "瑞銀", "瑞士信貸", "天利", "柏瑞",
+    "駿利亨德森", "駿利", "聯博", "路博邁", "高盛", "法巴", "百達", "PIMCO",
+    "品浩", "紐約梅隆", "宏利", "富達", "野村", "日盛", "德盛", "先機",
+    "鋒裕匯理", "東方匯理", "DWS", "德意志", "羅素", "拉薩德", "美盛",
+    "凱利", "GAM", "瑞聯", "安本", "首域", "威靈頓", "英仕曼", "貝萊",
+]
+
+
+def _issuer_from_name(name):
+    """境外基金名稱開頭即發行公司 → 抽出真正管理公司(取代錯誤的來源標籤)。"""
+    for m in _OFFSHORE_MGRS:
+        if m in name[:10]:
+            return m
+    return name.split("基金")[0][:6] if "基金" in name else "境外"
+
+
+def _active_passive(asset, name):
+    s = (asset or "") + (name or "")
+    if "被動" in s or "指數" in s:
+        return "被動"
+    return "主動"     # 境外共同基金多為主動；ETF 才多被動
+
+
 def scan_history_db(df: pd.DataFrame, threshold: float,
                     max_span: int = MAX_SPAN_DAYS) -> pd.DataFrame:
-    """每早掃描核心：對歷史庫每檔算「最新滾動跌幅」+ 歷史勝率。
-
-    對每檔基金：
-      1. 取最新10筆算當前滾動跌幅 → 是否觸發（≤threshold 且跨度有效）
-      2. 用全部歷史回測該門檻 → 歷史勝率（最佳持有天數）
-      3. 標註淨值截至日（鐵律16）
+    """每早掃描核心：對每檔算「最新滾動跌幅、觸發、10天前/最新淨值、資料品質」。
+    （歷史勝率移到『個別基金分析』，掃描表不再逐檔回測 → 快很多。）
     """
     rows = []
     for code, g in df.groupby("代碼"):
@@ -559,12 +580,12 @@ def scan_history_db(df: pd.DataFrame, threshold: float,
         if not rolling:
             continue
         last = rolling[-1]
-        name = g["名稱"].iloc[0] if "名稱" in g.columns else ""
+        name = str(g["名稱"].iloc[0]) if "名稱" in g.columns else ""
         region = g["境內外"].iloc[0] if "境內外" in g.columns else ""
-        issuer = g["發行"].iloc[0] if "發行" in g.columns else ""
+        issuer = str(g["發行"].iloc[0]) if "發行" in g.columns else ""
+        asset = g["資產類型"].iloc[0] if "資產類型" in g.columns else ""
         triggered = last["return"] <= threshold and last["valid"]
 
-        # 連續觸發天數：從最新往回數，連續有幾筆達門檻（使用者要求）
         consec = 0
         for r in reversed(rolling):
             if r["return"] <= threshold and r.get("valid", True):
@@ -572,38 +593,33 @@ def scan_history_db(df: pd.DataFrame, threshold: float,
             else:
                 break
 
-        # 歷史勝率（觸發後的最佳持有天數勝率）
-        best_wr, best_h, n_hist = None, None, 0
-        if triggered:
-            bt = run_full_backtest(prices, threshold, rolling, 0, 0.0, 0.0, max_span)
-            if bt:
-                n_hist = bt.get("觸發次數", 0)
-                tbl = build_entry_timing_table(bt)
-                idx = _pick_best_timing_idx(tbl)
-                if idx is not None:
-                    best_wr = tbl.loc[idx, "勝率"]
-                    best_h = tbl.loc[idx, "持有天數"]
+        # 發行公司：境外若被標成來源(yfinance)，改用名稱抽出的真管理公司
+        if region == "境外" and issuer in ("yfinance", "", "nan"):
+            issuer = _issuer_from_name(name)
 
         rows.append({
-            "代碼": code, "名稱": str(name)[:28], "境內外": region, "發行": issuer,
-            "分類": classify_etf(code),
+            "代碼": code,
+            "境內外": region,
+            "名稱": name[:40],
+            "發行公司": issuer,
+            "主被動": _active_passive(asset, name),
             "滾動10日%": round(last["return"], 2),
+            "10天前日期": last.get("base_date", ""),
+            "10天前淨值": round(last.get("base_price", 0), 4),
             "今日觸發": "🔴 是" if triggered else "—",
             "連續觸發天": consec,
-            "淨值截至": last["date"],
-            "資料品質": "✅ 正常" if last["valid"] else "⚠️ 資料稀疏({}天)".format(last["span_days"]),
-            "歷史觸發次數": n_hist if n_hist else "",
-            "歷史最佳勝率": best_wr if best_wr else "",
-            "最佳持有天": best_h if best_h else "",
+            "淨值最新日": last["date"],
+            "最新淨值": round(last.get("curr_price", 0), 4),
+            "資料品質": "✅ 正常" if last["valid"] else "⚠️ 稀疏({}天)".format(last["span_days"]),
         })
     if not rows:
         return pd.DataFrame()
     out = pd.DataFrame(rows)
-    # 觸發的排前面，再按滾動跌幅排序
     out["_t"] = (out["今日觸發"].astype(str).str.contains("是")).astype(int)
     out = out.sort_values(["_t", "連續觸發天", "滾動10日%"],
                           ascending=[False, False, True]).drop(columns="_t")
     return out
+
 
 def analyze_one_fund(df_one: pd.DataFrame, threshold: float,
                      max_span: int = MAX_SPAN_DAYS) -> dict:
@@ -1101,51 +1117,46 @@ def main():
                     b.metric("🔴 今日觸發", n_trig)
                     c.metric("觸發門檻", "{}%".format(scan_thr))
                     if n_trig > 0:
-                        st.success("**今天有 {} 檔觸發跌幅** — 下方紅點標記，已配對歷史勝率供你判斷。".format(n_trig))
-                    # ── 攤平表格（靜態HTML，隨頁面捲動、無iframe內捲軸；Q2修正）──
-                    #   不用 st.dataframe(固定height)：4700列會需169k px高度→render失敗變空白。
-                    #   改 to_html + st.markdown，整頁自然捲動、表頭sticky、無內捲框。
-                    _disp = result.copy()
-                    if "滾動10日%" in _disp.columns:
-                        _disp["滾動10日%"] = _disp["滾動10日%"].map(
-                            lambda v: "{:.2f}%".format(v) if pd.notna(v) else "")
-                    st.markdown(
-                        "<style>"
-                        ".scan-wrap{width:100%;overflow-x:auto;}"
-                        "table.scan-tbl{border-collapse:collapse;width:100%;font-size:14px;}"
-                        "table.scan-tbl thead th{position:sticky;top:0;background:#f0f2f6;"
-                        "z-index:1;text-align:left;padding:8px 10px;"
-                        "border-bottom:2px solid #d0d3d9;white-space:nowrap;}"
-                        "table.scan-tbl tbody td{padding:6px 10px;"
-                        "border-bottom:1px solid #eceef1;white-space:nowrap;}"
-                        "table.scan-tbl tbody tr:nth-child(even){background:#fafbfc;}"
-                        "table.scan-tbl tbody tr:hover{background:#eef4ff;}"
-                        "</style>", unsafe_allow_html=True)
-                    _html = _disp.to_html(index=False, escape=False, border=0,
-                                          classes="scan-tbl")
-                    st.markdown('<div class="scan-wrap">' + _html + "</div>",
-                                unsafe_allow_html=True)
-                    with st.expander("欄位說明（原滑鼠提示）"):
+                        st.success("**今天有 {} 檔觸發跌幅** — 點欄位標題可排序（例如點「境內外」把境內外分開）。".format(n_trig))
+
+                    # ── 欄位說明（移到表格上方；使用者要求）──
+                    with st.expander("📖 欄位說明（先看這個再讀表）"):
                         st.markdown(
                             "- **滾動10日%**：最新淨值 vs 往回第10筆淨值的報酬率，負值=下跌\n"
+                            "- **10天前日期／10天前淨值**：滾動10日的『起算基準點』\n"
                             "- **今日觸發**：最新滾動10日跌幅是否達門檻。🔴是=今天可考慮進場\n"
                             "- **連續觸發天**：從最新往回連續達門檻的筆數，越大代表跌勢持續中\n"
-                            "- **淨值截至**：該檔最新淨值日期（境內即時補到今天、境外用庫最新，各檔可不同）\n"
-                            "- **資料品質**：往回10筆橫跨天數；正常約14天，橫跨太久=有大缺口故不採計\n"
-                            "- **歷史觸發次數**：歷史總觸發次數，<10 勝率無統計意義\n"
-                            "- **歷史最佳勝率／最佳持有天**：觸發後於最佳持有天數的賺錢比例（樣本≥10才顯示）")
-                    # 資料品質警示（使用者反映「很多空白」的根因）
+                            "- **淨值最新日／最新淨值**：該檔最新一筆淨值的日期與值（境外有時差，各檔可不同）\n"
+                            "- **資料品質**：最近10筆淨值的曆日跨度。正常約14天；**>25天=有大缺口→標『稀疏』並作廢該筆**")
+
+                    # ── 掃描結果表（st.dataframe：原生排序、凍結表頭、滿版、內建下載）──
+                    _disp = result[[
+                        "代碼", "境內外", "名稱", "發行公司", "主被動", "滾動10日%",
+                        "10天前日期", "10天前淨值", "今日觸發", "連續觸發天",
+                        "淨值最新日", "最新淨值", "資料品質"]].reset_index(drop=True)
+                    st.dataframe(
+                        _disp, use_container_width=True, height=640, hide_index=True,
+                        column_config={
+                            "滾動10日%": st.column_config.NumberColumn("滾動10日%", format="%.2f%%"),
+                            "10天前淨值": st.column_config.NumberColumn("10天前淨值", format="%.4f"),
+                            "最新淨值": st.column_config.NumberColumn("最新淨值", format="%.4f"),
+                        })
+                    dl1, dl2 = st.columns([1, 4])
+                    dl1.download_button(
+                        "⬇️ 下載 CSV", _disp.to_csv(index=False).encode("utf-8-sig"),
+                        file_name="scan_{}.csv".format(dt.date.today().isoformat()),
+                        mime="text/csv", use_container_width=True)
+                    dl2.caption("列印：表格右上角展開全螢幕，或用瀏覽器 Ctrl+P。")
+
+                    # 資料品質警示
                     bad = (result["資料品質"].astype(str).str.contains("稀疏")).sum()
                     if bad:
-                        st.error(
-                            "⚠️ **{} / {} 檔資料品質不佳**（淨值公告有大缺口，"
-                            "往回10筆橫跨遠超過14天）。這些檔的『觸發』與『歷史勝率』會空白，"
-                            "因為系統判定不可信、拒絕產出假訊號。"
-                            "　**解法**：歷史庫需要補齊缺漏日期（重跑建庫）。".format(bad, len(result)))
-                    st.caption("⚠️ **各檔淨值截至日可能不同**（境外有時差），跨檔比較請看「淨值截至」欄。"
-                               "歷史勝率為觸發後最佳持有天數的回測勝率（樣本≥10才顯示，母專案同源）。")
-                    st.caption("ℹ️ 進場假設觸發日可成交（entry_lag=0，使用者裁決）；"
-                               "費用未計；基金實務申購有截止時點，實際成交價可能不同。")
+                        st.warning(
+                            "⚠️ **{} / {} 檔資料稀疏**（最近10筆淨值曆日跨度>25天，公告有大缺口）→ "
+                            "該筆作廢、不產假訊號。多為境外時差或停止公告的標的。".format(bad, len(result)))
+                    st.caption("ℹ️ 各檔『淨值最新日』可能不同（境外有時差），跨檔比較請對齊此欄。"
+                               "進場假設觸發日可成交（費用未計），實際申購有截止時點。")
+
 
 
     # ══ Tab1：分布校準（憲法：Tier1 第一個產出是分布，不是勝率表）══
