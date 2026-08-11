@@ -5,7 +5,7 @@ name: 建置 境外基金淨值庫 (cnyes+yfinance)
 
 on:
   schedule:
-    - cron: '0 14 * * 0'   # 每週日 14:00 UTC = 台北週日 22:00（境外NAV有時差，週更足夠）
+    - cron: '30 14 * * 1-5'   # 週一~五 14:30 UTC = 台北 22:30（每日補最新；接在境內排程後）
   workflow_dispatch:
     inputs:
       parallel:
