@@ -28,6 +28,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+try:
+    import mp_analysis as mp          # 母專案個別分析引擎（Stage 2b）
+    _HAS_MP = True
+except Exception:
+    _HAS_MP = False
+
 # ── 選用相依（缺少時不得使 app 崩潰，繼承母專案 try/except 保護原則）──
 try:
     import yfinance as yf
@@ -1347,91 +1353,185 @@ def main():
                 else:
                     st.warning("無資料。")
 
-    # ══ Tab1：🔍 個別基金分析（使用者要求：像個股版那樣做單檔深度分析）══
+    # ══ Tab1：🔍 個別基金分析（Stage 2b：母專案 8 表 + 走勢圖，含篩選）══
     with tabs[1]:
         st.subheader("🔍 個別基金分析")
-        st.caption("選一檔基金，看它的完整歷史：觸發點、各持有天數勝率、報酬分布、淨值走勢。")
+        st.caption("先用篩選縮小範圍→選一檔→看完整回測：勝率/報酬/累積損益/進場時機/回撤/年度/連續觸發，走勢圖在最後。")
 
-        hist_a, hsrc_a = load_history_db(None)   # 個別分析要完整歷史
+        hist_a, hsrc_a = load_history_db(None)
         if len(hist_a) == 0:
             st.info("尚無歷史庫，請先用 GitHub Actions 建庫。")
+        elif not _HAS_MP:
+            st.error("找不到 mp_analysis.py，請把它放進 repo 根目錄再 Reboot。")
         else:
-            ac1, ac2, ac3 = st.columns([2, 1, 1])
-            # 用「名稱(代碼)」讓使用者好找
-            opts = (hist_a[["代碼", "名稱"]].drop_duplicates("代碼")
+            # ── 篩選列：境內外 / 發行公司 / 系列 / 資產類型 / 投資區域 ──
+            f1, f2, f3 = st.columns(3)
+            f4, f5, f6 = st.columns(3)
+
+            def _opts(col):
+                if col not in hist_a.columns:
+                    return ["全部"]
+                return ["全部"] + sorted([x for x in hist_a[col].dropna().unique().tolist() if str(x).strip()])
+
+            sel_reg = f1.selectbox("境內/境外", _opts("境內外"), key="a_reg")
+            v = hist_a
+            if sel_reg != "全部":
+                v = v[v["境內外"] == sel_reg]
+            iss_opts = ["全部"] + sorted([x for x in v["發行"].dropna().unique().tolist() if str(x).strip()]) if "發行" in v.columns else ["全部"]
+            sel_iss = f2.selectbox("發行公司", iss_opts, key="a_iss")
+            if sel_iss != "全部":
+                v = v[v["發行"] == sel_iss]
+            ser_opts = ["全部"] + sorted([x for x in v["系列"].dropna().unique().tolist() if str(x).strip()]) if "系列" in v.columns else ["全部"]
+            sel_ser = f3.selectbox("系列（總代理旗下品牌）", ser_opts, key="a_ser")
+            if sel_ser != "全部":
+                v = v[v["系列"] == sel_ser]
+            sel_ast = f4.selectbox("資產類型", _opts("資產類型"), key="a_ast")
+            if sel_ast != "全部" and "資產類型" in v.columns:
+                v = v[v["資產類型"] == sel_ast]
+            sel_area = f5.selectbox("投資區域", _opts("投資區域"), key="a_area")
+            if sel_area != "全部" and "投資區域" in v.columns:
+                v = v[v["投資區域"] == sel_area]
+            thr_a = f6.number_input("觸發門檻(%)", value=-10.0, step=0.5, max_value=0.0, key="thr_a")
+
+            opts = (v[["代碼", "名稱"]].drop_duplicates("代碼")
                     .assign(_lab=lambda d: d["名稱"].astype(str) + "  (" + d["代碼"].astype(str) + ")")
                     .sort_values("_lab"))
-            lab2code = dict(zip(opts["_lab"], opts["代碼"]))
-            pick_lab = ac1.selectbox("選擇基金（可打字搜尋）", list(lab2code.keys()))
-            thr_a = ac2.number_input("觸發門檻(%)", value=-10.0, step=0.5,
-                                     max_value=0.0, key="thr_a")
-            span_a = ac3.number_input("跨度上限(天)", value=max_span, step=1,
-                                      min_value=14, key="span_a")
+            if len(opts) == 0:
+                st.warning("篩選後沒有基金，請放寬條件。")
+            else:
+                lab2code = dict(zip(opts["_lab"], opts["代碼"]))
+                st.caption("篩選後 {} 檔可選".format(len(lab2code)))
+                pick_lab = st.selectbox("選擇基金（可打字搜尋）", list(lab2code.keys()), key="a_pick")
 
-            if st.button("🔍 分析這檔", type="primary"):
-                code_a = lab2code[pick_lab]
-                one = hist_a[hist_a["代碼"] == code_a]
-                res = analyze_one_fund(one, thr_a, span_a)
-                if "error" in res:
-                    st.error(res["error"])
-                else:
-                    s = res["stats"]
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("資料年數", "{} 年".format(s["年數"]),
-                              help="{} ~ {}".format(s["資料起"], s["資料迄"]))
-                    m2.metric("歷史觸發次數", s["歷史觸發次數"],
-                              help="歷史上滾動10日跌幅達門檻的次數")
-                    m3.metric("最深跌幅", "{}%".format(s["最深跌幅"]))
-                    m4.metric("有效視窗", "{} / {}".format(
-                        s["有效視窗"], s["有效視窗"] + s["無效視窗"]),
-                        help="無效=淨值公告有大缺口，該筆不採計")
-
-                    if s["無效視窗"] > s["有效視窗"]:
-                        st.warning("⚠️ 這檔基金**超過一半的資料有缺口**（淨值公告不連續），"
-                                   "分析結果可信度低。")
-
-                    st.markdown("#### 📈 淨值走勢與觸發點")
-                    pr = res["prices"]
-                    dfp = pd.DataFrame({"日期": list(pr.keys()), "淨值": list(pr.values())})
-                    dfp = dfp.sort_values("日期")
-                    st.line_chart(dfp.set_index("日期")["淨值"], height=260)
-                    if res["triggers"]:
-                        tdf = pd.DataFrame([{
-                            "觸發日": t["date"], "滾動10日%": t["return"],
-                            "當時淨值": round(t["curr_price"], 4),
-                            "視窗跨度(天)": t["span_days"],
-                        } for t in res["triggers"]])
-                        st.markdown("#### 🔴 歷史觸發紀錄（共 {} 次）".format(len(tdf)))
-                        st.dataframe(tdf.sort_values("觸發日", ascending=False),
-                                     width="stretch", height=240)
+                if st.button("🔍 分析這檔", type="primary"):
+                    code_a = lab2code[pick_lab]
+                    one = hist_a[hist_a["代碼"] == code_a]
+                    prices = hist_to_prices(one)
+                    if len(prices) < 30:
+                        st.error("這檔可用淨值太少（{}筆），無法回測。".format(len(prices)))
                     else:
-                        st.info("此門檻下無歷史觸發。試著放寬門檻"
-                                "（此檔 P5={}% / P10={}%）。".format(s["P5"], s["P10"]))
+                        thr = float(thr_a)
+                        HZ = mp.HORIZONS
+                        win_df, avg_df, dd_df = mp.build_summary_tables(prices)
 
-                    tbl = res["timing_tbl"]
-                    if len(tbl):
-                        st.markdown("#### 🎯 各持有天數的勝率（觸發後進場）")
-                        st.dataframe(tbl, width="stretch")
-                        bi = res["best_idx"]
-                        if bi is not None:
-                            r = tbl.loc[bi]
-                            st.success("★ 最佳：持有 **{}** 天｜勝率 **{}**｜"
-                                       "平均報酬 {}｜樣本 {}".format(
-                                           r["持有天數"], r["勝率"],
-                                           r["平均報酬%"], r["樣本數"]))
+                        def _style_win(df):
+                            cols = [c for c in df.columns if "天勝率" in c]
+                            return df.style.applymap(mp.color_winrate_80only, subset=cols)
+
+                        st.markdown("### 表A：勝率（各門檻 × 觀察天數）｜橘色 ≥ 80%")
+                        st.caption("勝率＝觸發進場後，T+N 天收盤價 > 進場價的比例")
+                        st.dataframe(_style_win(win_df), use_container_width=True)
+
+                        st.markdown("### 表B：平均單次報酬%（各門檻 × 觀察天數）")
+                        st.dataframe(avg_df, use_container_width=True)
+
+                        st.markdown("### 表C：實際累積損益%（按淨值進場，門檻 {}）".format(thr))
+                        ytc = mp.build_yearly_cumulative_table(prices, thr)
+                        if isinstance(ytc, tuple):
+                            ytc = ytc[0]
+                        if ytc is not None and len(ytc):
+                            st.dataframe(ytc, use_container_width=True)
                         else:
-                            st.info("無任何持有天數樣本數≥{}，不硬推最佳"
-                                    "（樣本太少的勝率沒有統計意義）。".format(MIN_SAMPLE))
+                            st.info("此門檻下無足夠觸發樣本。")
 
-                    st.markdown("#### 📊 滾動10日報酬分布")
-                    rr_all = [r["return"] for r in res["rolling"] if r["valid"]]
-                    if rr_all:
-                        d1, d2, d3, d4 = st.columns(4)
-                        d1.metric("P1", "{}%".format(round(float(np.percentile(rr_all, 1)), 2)))
-                        d2.metric("P5", "{}%".format(s["P5"]))
-                        d3.metric("P10", "{}%".format(s["P10"]))
-                        d4.metric("中位數", "{}%".format(s["中位數"]))
-                        st.caption("P5 = 只有 5% 的日子跌幅比這更深。門檻設太深會沒樣本。")
+                        st.markdown("### 表E：進場時機完整比較（勝率，門檻 {}）".format(thr))
+                        st.caption("連續第1天=首次觸發當天進｜第2天=等跌第2天再進｜第3天以後=等更深跌｜結束翌日=止跌後才進")
+
+                        def _timing_matrix(value_key):
+                            rows = {}
+                            for h in HZ:
+                                t = mp.build_entry_timing_table(prices, thr, h)
+                                if t is None:
+                                    continue
+                                for _, r in t.iterrows():
+                                    rows.setdefault(r["進場時機"], {})["{}天".format(h)] = r[value_key]
+                            return pd.DataFrame(rows).T if rows else None
+
+                        mtx_wr = _timing_matrix("勝率")
+                        if mtx_wr is not None:
+                            wr_cols = list(mtx_wr.columns)
+                            st.dataframe(mtx_wr.style.applymap(mp.color_winrate_80only, subset=wr_cols),
+                                         use_container_width=True)
+                        else:
+                            st.info("此門檻下無觸發。")
+
+                        st.markdown("### 平均報酬對照（各進場時機 × 觀察天數）")
+                        mtx_ar = _timing_matrix("平均報酬%")
+                        if mtx_ar is not None:
+                            st.dataframe(mtx_ar, use_container_width=True)
+
+                        st.markdown("### 表F：最大回撤分析（門檻 {}）".format(thr))
+                        st.caption("進場後先跌到低點再反彈。「平均回撤發生於第幾天」＝你需要撐過的浮虧期。")
+                        ddt = mp.build_dd_timing_table(prices, thr)
+                        if ddt is not None and len(ddt):
+                            st.dataframe(ddt, use_container_width=True)
+                        else:
+                            st.info("此門檻下無觸發樣本。")
+
+                        st.markdown("### 年度明細：每年平均單次報酬%（門檻 {}）".format(thr))
+                        yt, _ = mp.build_yearly_table(prices, thr)
+                        if yt is not None and len(yt):
+                            st.dataframe(yt, use_container_width=True)
+                        else:
+                            st.info("此門檻下無年度樣本。")
+
+                        st.markdown("### 連續觸發分析（勝率，門檻 {}）".format(thr))
+                        st.caption("第1天=首次觸發｜第2天=連跌第2天｜第3天=連跌第3天｜第4天以後=持續下跌")
+
+                        def _consec_matrix(value_key):
+                            rows = {}
+                            for h in HZ:
+                                c = mp.build_consec_analysis(prices, thr, h)
+                                if c is None or len(c) == 0:
+                                    continue
+                                first = c.columns[0]
+                                for _, r in c.iterrows():
+                                    key = r[first]
+                                    if value_key in c.columns:
+                                        rows.setdefault(key, {})["{}天".format(h)] = r[value_key]
+                            return pd.DataFrame(rows).T if rows else None
+
+                        cmx = _consec_matrix("勝率")
+                        if cmx is not None:
+                            st.dataframe(cmx.style.applymap(mp.color_winrate_80only, subset=list(cmx.columns)),
+                                         use_container_width=True)
+                        else:
+                            st.info("此門檻下無連續觸發樣本。")
+
+                        # ── 走勢圖（最後）：各門檻 3/5/10/15/20% 觸發標記 ──
+                        st.markdown("### 📈 淨值走勢 + 各門檻觸發標記")
+                        try:
+                            import plotly.graph_objects as go
+                            dates_all = sorted(prices.keys())
+                            price_values = [prices[d] for d in dates_all]
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(x=dates_all, y=price_values, mode="lines",
+                                                     name="淨值", line=dict(color="#2196F3", width=1.5)))
+                            cmap = {-3: "#FFC107", -5: "#FFA500", -10: "#E63946",
+                                    -15: "#9B2335", -20: "#5C0A14"}
+                            for t in [-3, -5, -10, -15, -20]:
+                                r = mp.run_full_backtest(prices, t)
+                                if not r:
+                                    continue
+                                tset = set(r["trigger_dates"])
+                                tx = [d for d in dates_all if d in tset]
+                                ty = [prices[d] for d in tx]
+                                lab = "門檻 {}% ({}次)".format(t, r["total"])
+                                fig.add_trace(go.Scatter(
+                                    x=tx, y=ty, mode="markers", name=lab,
+                                    marker=dict(color=cmap[t], size=7),
+                                    visible=True if abs(t - thr) < 0.5 else "legendonly"))
+                            fig.update_layout(height=460, xaxis_title="日期", yaxis_title="淨值",
+                                              hovermode="x unified",
+                                              legend=dict(orientation="h", yanchor="bottom", y=1.02))
+                            st.plotly_chart(fig, use_container_width=True)
+                        except Exception as e:
+                            st.line_chart(pd.DataFrame({"淨值": price_values}, index=dates_all))
+
+                        st.download_button(
+                            "⬇️ 下載勝率表 CSV", win_df.to_csv(index=False).encode("utf-8-sig"),
+                            file_name="{}_勝率.csv".format(code_a), mime="text/csv")
+                        st.caption("列印：Ctrl+P。母專案同源回測；已套用跨度上限過濾（境外假訊號防護）。")
 
     # ══ Tab3：回測 ══
     with tabs[3]:
