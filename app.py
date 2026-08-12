@@ -370,14 +370,23 @@ def load_history_db(max_years: Optional[int] = None) -> Tuple[pd.DataFrame, str]
             df["淨值"] = pd.to_numeric(df["淨值"], errors="coerce")
             df = df.dropna(subset=["淨值"])
             df["境內外"] = "境內"
-            df["發行"] = df["投信"] if "投信" in df.columns else ""
+            # 發行公司：投信名 → 官方『代碼 名稱』（境內外收斂）
+            if "投信" in df.columns:
+                _t = df["投信"].astype(str)
+                _m = {x: _canonical_issuer(x, False) for x in _t.unique()}
+                df["發行"] = _t.map(_m)
+                _ms = {x: _series_from(x, False) for x in _t.unique()}
+                df["系列"] = _t.map(_ms)
+            else:
+                df["發行"] = ""
+                df["系列"] = ""
             for c in ["資產類型", "投資區域"]:
                 if c not in df.columns:
                     df[c] = "未分類"
-            df = df[["代碼", "日期", "淨值", "名稱", "境內外", "發行",
+            df = df[["代碼", "日期", "淨值", "名稱", "境內外", "發行", "系列",
                      "資產類型", "投資區域"]]
             # 重複性高的欄位轉 category，記憶體可省 5-10 倍
-            for c in ["名稱", "境內外", "發行", "資產類型", "投資區域"]:
+            for c in ["名稱", "境內外", "發行", "系列", "資產類型", "投資區域"]:
                 df[c] = df[c].astype("category")
             frames.append(df)
             n_sitca += len(df)
@@ -406,16 +415,18 @@ def load_history_db(max_years: Optional[int] = None) -> Tuple[pd.DataFrame, str]
                 df["淨值"] = pd.to_numeric(df["淨值"], errors="coerce")
                 df = df.dropna(subset=["淨值"])
                 df["境內外"] = "境外"
-                # 發行公司：境外用基金名抽出真品牌(取代 yfinance 來源標籤)→篩選下拉+表格一次都對
+                # 發行公司：基金名 → 品牌 → 官方總代理『代碼 名稱』（與境內同表收斂）
                 _names = df["名稱"].astype(str)
-                _uniq = {nm: _issuer_from_name(nm) for nm in _names.unique()}
+                _uniq = {nm: _canonical_issuer(nm, True) for nm in _names.unique()}
                 df["發行"] = _names.map(_uniq)
+                _useries = {nm: _series_from(nm, True) for nm in _names.unique()}
+                df["系列"] = _names.map(_useries)
                 for c in ["資產類型", "投資區域"]:
                     if c not in df.columns:
                         df[c] = "未分類"
-                df = df[["代碼", "日期", "淨值", "名稱", "境內外", "發行",
+                df = df[["代碼", "日期", "淨值", "名稱", "境內外", "發行", "系列",
                          "資產類型", "投資區域"]]
-                for c in ["名稱", "境內外", "發行", "資產類型", "投資區域"]:
+                for c in ["名稱", "境內外", "發行", "系列", "資產類型", "投資區域"]:
                     df[c] = df[c].astype("category")
                 frames.append(df)
                 n_off += len(df)
@@ -586,6 +597,95 @@ def _active_passive(asset, name):
     return "主動"     # 境外共同基金多為主動；ETF 才多被動
 
 
+# ── 官方發行公司對照（品牌 → 總代理代碼+名；Greg 校訂 2026-08-11 第2版）──
+# 發行公司=總代理（多品牌併入同一總代理）；另用「系列」欄保留實際品牌。
+_BRAND2AGENT = {
+    "第一金": ("A0003", "第一金投信"), "匯豐": ("A0004", "匯豐投信"), "滙豐": ("A0004", "匯豐投信"),
+    "景順": ("A0006", "景順投信"), "瀚亞": ("A0007", "瀚亞投信"), "玉山": ("A0008", "玉山投信"),
+    "摩根士丹利": ("B0246", "國泰投顧"),          # ← 更正：MS=國泰投顧(與JPM摩根不同)
+    "摩根": ("A0011", "摩根投信"),
+    "瑞銀": ("A0015", "瑞銀投信"), "台中銀": ("A0017", "台中銀投信"),
+    "聯博": ("A0018", "聯博投信"), "AB": ("A0018", "聯博投信"),        # AB=聯博同一家
+    "柏瑞": ("A0021", "柏瑞投信"), "MFS": ("A0021", "柏瑞投信"),
+    "中國信託": ("A0026", "中國信託投信"), "中信": ("A0026", "中國信託投信"),
+    "宏利": ("A0027", "宏利投信"), "安本": ("A0027", "宏利投信"),
+    "貝萊德": ("A0031", "貝萊德投信"),
+    "野村": ("A0032", "野村投信"), "駿利亨德森": ("A0032", "野村投信"), "駿利": ("A0032", "野村投信"),
+    "亨德森": ("A0032", "野村投信"), "高盛": ("A0032", "野村投信"),      # 高盛=野村(非高曼)
+    "NN": ("A0032", "野村投信"), "天達": ("A0032", "野村投信"), "晉達": ("A0032", "野村投信"),
+    "東方匯理": ("A0035", "東方匯理投信"), "鋒裕匯理": ("A0035", "東方匯理投信"), "鋒裕": ("A0035", "東方匯理投信"),
+    "安聯": ("A0036", "安聯投信"), "富達": ("A0038", "富達投信"),
+    "德銀": ("A0040", "德銀遠東投信"), "DWS": ("A0040", "德銀遠東投信"),
+    "施羅德": ("A0042", "施羅德投信"),
+    # 富蘭克林集團(含坦伯頓/鄧普頓/凱利)境外總代理＝富蘭克林投顧 B0029
+    "富蘭克林坦伯頓": ("B0029", "富蘭克林投顧"), "富蘭克林": ("B0029", "富蘭克林投顧"),
+    "富坦": ("B0029", "富蘭克林投顧"), "坦伯頓": ("B0029", "富蘭克林投顧"),
+    "鄧普頓": ("B0029", "富蘭克林投顧"), "凱利": ("B0029", "富蘭克林投顧"),
+    "美盛凱利": ("B0029", "富蘭克林投顧"),
+    "台新": ("A0047", "台新投信"), "合作金庫": ("A0048", "合庫投信"), "合庫": ("A0048", "合庫投信"),
+    "大華銀": ("A0049", "大華銀投信"), "利安資金": ("A0049", "大華銀投信"), "利安": ("A0049", "大華銀投信"),
+    "路博邁": ("A0050", "路博邁投信"),
+    # 純投顧 B
+    "美盛": ("B0065", "美盛投顧"),
+    "霸菱": ("B0149", "霸菱投顧"),
+    "Muzinich": ("B0162", "全球投顧"), "Muzini": ("B0162", "全球投顧"), "繆思": ("B0162", "全球投顧"),
+    "先機": ("B0313", "富盛投顧"),
+    "法盛": ("A0026", "中國信託投信"), "Natixis": ("A0026", "中國信託投信"),  # Natixis法盛投資管理=中信代理
+    "法巴": ("B0049", "法銀巴黎投顧"), "法國巴黎": ("B0049", "法銀巴黎投顧"),
+    "百達": ("B0328", "百達投顧"), "品浩": ("B0351", "品浩太平洋投顧"), "PIMCO": ("B0351", "品浩太平洋投顧"),
+    "威廉博萊": ("B0355", "展新投顧"), "紐約梅隆": ("B0360", "紐約梅隆投顧"), "M&G": ("B0367", "英卓投顧"),
+    "瑞聯": ("B0044", "宏遠投顧"),                # UBAM，已併入宏遠投顧
+    # 已退出/無台灣總代理 → 標註，不給代碼
+    "天利": ("--", "天利(已退出)"), "木星": ("--", "木星(已退出)"),
+    "未來資產": ("--", "未來資產(已終止)"),
+    # 待補官方代碼（顯示品牌名，無碼）
+    "保德信": ("--", "保德信"), "PGIM": ("--", "保德信"), "道富": ("--", "道富環球"),
+    "先鋒": ("--", "先鋒領航"),
+}
+_BRAND_KEYS = sorted(_BRAND2AGENT, key=len, reverse=True)   # 長品牌先比，避免誤匹配
+_NAME2CODE = {}
+for _c, _n in SITCA_COMPANIES.items():
+    _NAME2CODE[_n] = _c
+    _NAME2CODE[_n.replace("滙", "匯")] = _c
+
+
+def _fmt_agent(code, name):
+    name = name.replace("滙", "匯")
+    return name if code == "--" else "{} {}".format(code, name)
+
+
+def _canonical_issuer(text, offshore):
+    """境內給投信名、境外給基金名 → 統一回『代碼 官方名』；同一家境內外收斂。"""
+    text = (text or "").strip()
+    if not text:
+        return "未分類"
+    if offshore:
+        stem = _issuer_from_name(text)
+        for k in _BRAND_KEYS:
+            if stem.startswith(k) or text.startswith(k):
+                return _fmt_agent(*_BRAND2AGENT[k])
+        return stem                                   # 未對到官方 → 乾淨品牌
+    # 境內：投信名 → 加官方 A 碼
+    code = _NAME2CODE.get(text) or _NAME2CODE.get(text.replace("滙", "匯"))
+    if code:
+        return _fmt_agent(code, SITCA_COMPANIES.get(code, text))
+    for k in _BRAND_KEYS:                              # 境內外收斂
+        if text.startswith(k):
+            return _fmt_agent(*_BRAND2AGENT[k])
+    return text
+
+
+def _series_from(text, offshore):
+    """系列＝實際品牌（同一總代理下用此區分 NN／天達／駿利…）。用對照品牌key避免碎片。"""
+    if offshore:
+        stem = _issuer_from_name(text)
+        for k in _BRAND_KEYS:
+            if stem.startswith(k) or text.startswith(k):
+                return k
+        return stem
+    return (text or "").replace("投信", "").replace("證券投資信託", "").strip() or "境內"
+
+
 def scan_history_db(df: pd.DataFrame, threshold: float,
                     max_span: int = MAX_SPAN_DAYS) -> pd.DataFrame:
     """每早掃描核心：對每檔算「最新滾動跌幅、觸發、10天前/最新淨值、資料品質」。
@@ -603,6 +703,7 @@ def scan_history_db(df: pd.DataFrame, threshold: float,
         name = str(g["名稱"].iloc[0]) if "名稱" in g.columns else ""
         region = g["境內外"].iloc[0] if "境內外" in g.columns else ""
         issuer = str(g["發行"].iloc[0]) if "發行" in g.columns else ""
+        series = str(g["系列"].iloc[0]) if "系列" in g.columns else ""
         asset = g["資產類型"].iloc[0] if "資產類型" in g.columns else ""
         triggered = last["return"] <= threshold and last["valid"]
 
@@ -622,6 +723,7 @@ def scan_history_db(df: pd.DataFrame, threshold: float,
             "境內外": region,
             "名稱": name[:40],
             "發行公司": issuer,
+            "系列": series,
             "主被動": _active_passive(asset, name),
             "滾動10日%": round(last["return"], 2),
             "10天前日期": last.get("base_date", ""),
@@ -1083,17 +1185,23 @@ def main():
             pick_issuer = fc2.selectbox("發行公司/投信", issuer_opts)
 
             fc3, fc4, fc5 = st.columns(3)
+            # 系列：依已選發行公司(總代理)動態縮小 → 例如野村投信下可選 NN/天達/駿利…
+            _ser = _iss if pick_issuer == "全部" else _iss[_iss["發行"] == pick_issuer]
+            series_opts = ["全部"] + sorted([s for s in _ser["系列"].dropna().unique() if s])
+            pick_series = fc3.selectbox("系列（總代理旗下品牌）", series_opts)
             asset_opts = ["全部"] + sorted([a for a in hist["資產類型"].dropna().unique() if a])
-            pick_asset = fc3.selectbox("資產類型", asset_opts)
+            pick_asset = fc4.selectbox("資產類型", asset_opts)
             area_opts = ["全部"] + sorted([r for r in hist["投資區域"].dropna().unique() if r])
-            pick_area = fc4.selectbox("投資區域", area_opts)
-            scan_thr = fc5.number_input("觸發門檻(%)", value=-10.0, step=0.5, max_value=0.0)
+            pick_area = fc5.selectbox("投資區域", area_opts)
+            scan_thr = st.number_input("觸發門檻(%)", value=-10.0, step=0.5, max_value=0.0)
 
             view = hist.copy()
             if pick_region != "全部":
                 view = view[view["境內外"] == pick_region]
             if pick_issuer != "全部":
                 view = view[view["發行"] == pick_issuer]
+            if pick_series != "全部":
+                view = view[view["系列"] == pick_series]
             if pick_asset != "全部":
                 view = view[view["資產類型"] == pick_asset]
             if pick_area != "全部":
@@ -1151,7 +1259,7 @@ def main():
 
                     # ── 掃描結果表（st.dataframe：原生排序、凍結表頭、滿版、內建下載）──
                     _disp = result[[
-                        "代碼", "境內外", "名稱", "發行公司", "主被動", "滾動10日%",
+                        "代碼", "境內外", "名稱", "發行公司", "系列", "主被動", "滾動10日%",
                         "10天前日期", "10天前淨值", "今日觸發", "連續觸發天",
                         "淨值最新日", "最新淨值", "資料品質"]].reset_index(drop=True)
                     st.dataframe(
