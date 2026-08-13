@@ -1161,11 +1161,92 @@ def main():
 
     threshold = -10.0  # 各 tab 內可各自調整
 
-    tabs = st.tabs(["☀️ 每早掃描", "🔍 個別基金分析", "📊 分布校準",
-                    "🔬 ETF回測", "📒 追蹤日誌", "🛡️ 系統檢核", "🔌 SITCA 連線測試"])
+    tab_sys, tab_scan, tab_fund, tab_cmp, tab_notes = st.tabs(
+        ["🛡️ 系統檢核", "☀️ 每早掃描", "🔍 個別基金分析", "🆚 同類型比較", "📝 筆記"])
 
-    # ══ Tab0：☀️ 每早掃描（C層 — 每天第一個看的畫面）══
-    with tabs[0]:
+    # ══ 系統檢核（狀態 + 檢核 + SITCA連線測試，合併）══
+    with tab_sys:
+        st.subheader("🛡️ 系統檢核")
+
+        st.markdown("### 📊 資料源與完整度（即時）")
+        _hchk, _hsrc = load_history_db(None)
+        if len(_hchk):
+            _dom = _hchk[_hchk["境內外"] == "境內"]
+            _off = _hchk[_hchk["境內外"] == "境外"]
+            _q1, _q2, _q3, _q4 = st.columns(4)
+            _q1.metric("境內基金", "{:,}".format(_dom["代碼"].nunique()))
+            _q2.metric("境外基金", "{:,}".format(_off["代碼"].nunique()))
+            _q3.metric("總淨值筆數", "{:,}".format(len(_hchk)))
+            _dl = _dom["日期"].max() if len(_dom) else "-"
+            _ol = _off["日期"].max() if len(_off) else "-"
+            _q4.metric("境內最新日", str(_dl))
+            st.info("境內最新淨值日 **{}**｜境外最新淨值日 **{}**（境外有時差，通常慢1–2天）。"
+                    "資料源：{}".format(_dl, _ol, " + ".join(_hsrc)))
+        else:
+            st.warning("歷史庫尚未載入，請先建庫。")
+        st.markdown("**排程狀態**：GitHub → Actions 看『每日補最新 SITCA 淨值』(境內每日) 與 "
+                    "『建置 境外基金淨值庫』(境外每日) 是否綠燈。偶爾一天紅(假日)免理；連續紅才需處理。")
+        st.markdown("---")
+
+        st.markdown("### ✅ 邏輯檢核")
+        st.subheader("🛡️ 系統檢核")
+        chk = run_system_checks(adjust, fee_buy, fee_sell, entry_lag)
+        st.dataframe(chk, width="stretch")
+        fails = chk[(chk["結果"].str.contains("FAIL")) & (chk["檢核項目"].isin(CRITICAL_CHECKS))]
+        if len(fails):
+            st.error("🚨 有 {} 項關鍵檢核未通過，結果不可信。".format(len(fails)))
+        else:
+            st.success("✅ 全部關鍵檢核通過。")
+        st.caption("CRITICAL_CHECKS 與 IMPACT_MAP 中 severity=='error' 項目自動同步（母專案架構）。")
+
+    # ══ Tab6：SITCA 連線測試（Tier2 資料源端到端驗證）══
+
+        st.markdown("---")
+        st.markdown("### 🔌 SITCA 境內連線測試")
+        st.subheader("🔌 SITCA 境內基金淨值 — 連線測試")
+        st.info("**目的**：驗證「境內基金」這條資料源在 Streamlit Cloud 上端到端可用。"
+                "SITCA 是官方唯一來源，一次 POST 回一整家投信的所有基金（含主動ETF）當日淨值。"
+                "解析邏輯已用真實 VIEWSTATE 離線驗證正確，此處驗的是**真實網路連線**。")
+        if not _HAS_REQ:
+            st.error("requests 不可用，請確認 requirements.txt 含 requests。")
+        else:
+            cc1, cc2 = st.columns([2, 1])
+            comp_label = cc1.selectbox(
+                "選擇投信",
+                options=list(SITCA_COMPANIES.keys()),
+                format_func=lambda c: "{} {}".format(c, SITCA_COMPANIES[c]),
+                index=list(SITCA_COMPANIES.keys()).index("A0005"),
+            )
+            # 預設用最近一個營業日（往回跳過週末）
+            _d = dt.date.today() - dt.timedelta(days=1)
+            while _d.weekday() >= 5:
+                _d -= dt.timedelta(days=1)
+            test_date = cc2.date_input("查詢日期", value=_d)
+            date_str = test_date.strftime("%Y%m%d")
+
+            if st.button("🔍 測試 SITCA 連線", type="primary"):
+                with st.spinner("① GET 取 token → ② POST 查詢 → ③ 解析 …"):
+                    rows, msg = fetch_sitca_nav(comp_label, date_str)
+                if rows:
+                    st.success(msg)
+                    df = pd.DataFrame(rows)
+                    n_active = int(df["分類"].str.startswith("主動ETF").sum())
+                    a, b, c = st.columns(3)
+                    a.metric("解析基金數", len(df))
+                    b.metric("其中主動ETF", n_active)
+                    c.metric("投信", SITCA_COMPANIES[comp_label])
+                    st.dataframe(df, width="stretch")
+                    st.success("✅ **SITCA 端到端可用**。境內基金資料源確認打通，"
+                               "可進入 Tier2 全市場 bulk build。請把此畫面截圖回報。")
+                else:
+                    st.error(msg)
+                    st.caption("若失敗，請把上面紅字整段回報。依鐵律9：看確切錯誤才動手，不猜。")
+            st.caption("ℹ️ 此頁只讀取、不寫入。SITCA 資料更新頻率為每個營業日。"
+                       "假日或當日未公告時可能解析 0 筆，屬正常，換前一個營業日再試。")
+
+
+
+    with tab_scan:
         st.subheader("☀️ 每早掃描 — 今天誰觸發 + 歷史勝率")
         depth_opt = st.radio(
             "歷史深度（資料量大，先用小範圍確保不當機）",
@@ -1293,68 +1374,7 @@ def main():
 
 
 
-    # ══ Tab1：分布校準（憲法：Tier1 第一個產出是分布，不是勝率表）══
-    # ══ Tab2：📊 分布校準（ETF，走 yfinance 即時）══
-    with tabs[2]:
-        st.subheader("📊 分布校準 — 先看分布，再訂門檻")
-        st.info("**為什麼要先看分布**：母專案門檻是在台股交易日曆上校準的，"
-                "基金/ETF 非營業日各異，直接套用會失準。先看實際跌幅分布再訂門檻。")
-        if not _HAS_YF:
-            st.error("yfinance 不可用，請確認 requirements.txt 含 yfinance。")
-        else:
-            etf_map, _src = fetch_etf_list()
-            codes_all = sorted(etf_map.keys())
-            _dft = [c for c in ["0050.TW", "006208.TW", "00878.TW", "0056.TW"]
-                    if c in codes_all] or codes_all[:4]
-            picks = st.multiselect("選擇 ETF（可多選）", codes_all,
-                                   default=_dft, key="pick_etf")
-            st.caption("清單來源：{}".format(_src))
-
-            if st.button("跑分布", type="primary", key="btn_dist"):
-                rows, spans = [], []
-                prog = st.progress(0.0)
-                for i, code in enumerate(picks):
-                    px, err = fetch_prices(code, adjust)
-                    prog.progress((i + 1) / max(len(picks), 1))
-                    if err or not px:
-                        st.warning("{}：{}".format(code, err or "無資料"))
-                        continue
-                    rr = calc_all_rolling_returns(px, ROLL_N, max_span)
-                    if not rr:
-                        continue
-                    vals = np.array([r["return"] for r in rr if r["valid"]], dtype=float)
-                    spans.extend([r["span_days"] for r in rr])
-                    if len(vals) == 0:
-                        continue
-                    dts = sorted(px.keys())
-                    rows.append({
-                        "代碼": code, "分類": classify_etf(code),
-                        "資料起": dts[0], "資料截至": dts[-1], "筆數": len(px),
-                        "年數": round((dt.date.fromisoformat(dts[-1])
-                                      - dt.date.fromisoformat(dts[0])).days / 365.25, 1),
-                        "P1": round(float(np.percentile(vals, 1)), 2),
-                        "P5": round(float(np.percentile(vals, 5)), 2),
-                        "P10": round(float(np.percentile(vals, 10)), 2),
-                        "中位數": round(float(np.median(vals)), 2),
-                    })
-                prog.empty()
-                if rows:
-                    st.dataframe(pd.DataFrame(rows), width="stretch")
-                    st.caption("**怎麼讀**：P5 = 只有 5% 的日子跌幅比這更深。"
-                               "門檻設在 P1 會少到沒樣本（n<10 無統計意義）。")
-                    if spans:
-                        sp = np.array(spans, dtype=float)
-                        st.markdown("**視窗跨度檢查**（正常應為 14 天）")
-                        q1, q2, q3 = st.columns(3)
-                        q1.metric("跨度=14天佔比",
-                                  "{:.1f}%".format(float((sp == 14).mean() * 100)))
-                        q2.metric("跨度中位數", "{:.0f} 天".format(float(np.median(sp))))
-                        q3.metric("超過上限筆數", int((sp > max_span).sum()))
-                else:
-                    st.warning("無資料。")
-
-    # ══ Tab1：🔍 個別基金分析（Stage 2b：母專案 8 表 + 走勢圖，含篩選）══
-    with tabs[1]:
+    with tab_fund:
         st.subheader("🔍 個別基金分析")
         st.caption("先用篩選縮小範圍→選一檔→看完整回測：勝率/報酬/累積損益/進場時機/回撤/年度/連續觸發，走勢圖在最後。")
 
@@ -1534,124 +1554,124 @@ def main():
                         st.caption("列印：Ctrl+P。母專案同源回測；已套用跨度上限過濾（境外假訊號防護）。")
 
     # ══ Tab3：回測 ══
-    with tabs[3]:
-        st.subheader("回測")
-        picks = st.session_state.get('pick_etf', [])
-        t1_picks = [c for c in picks if is_tier1(c)]
-        skipped = [c for c in picks if not is_tier1(c)]
-        if skipped:
-            st.warning("**憲法「九」**：以下為主動ETF（上市<3年，五年/十年績效欄空白），"
-                       "屬 Tier4「只收資料、不出結論」，已排除：{}".format("、".join(skipped)))
-        if st.button("跑回測", type="primary", key="bt"):
-            for code in t1_picks:
-                px, err = fetch_prices(code, adjust)
-                if err or not px:
-                    st.warning("{}：{}".format(code, err or "無資料"))
-                    continue
-                rolling = calc_all_rolling_returns(px, ROLL_N, max_span)
-                bt = run_full_backtest(px, threshold, rolling, entry_lag,
-                                       fee_buy, fee_sell, max_span)
-                st.markdown("### {}".format(code))
-                if not bt:
-                    st.info("門檻 {}% 下無有效觸發。試著放寬門檻（見分布校準頁）。".format(threshold))
-                    continue
-                a, b, c, d = st.columns(4)
-                a.metric("觸發次數", bt["觸發次數"])
-                b.metric("最大連續觸發", bt["最大連續觸發"])
-                c.metric("跨度作廢(鐵律16)", bt["跨度作廢筆數"])
-                d.metric("entry_lag", bt["entry_lag"])
-                tbl = build_entry_timing_table(bt)
-                if not tbl.empty:
-                    best = _pick_best_timing_idx(tbl)
-                    st.dataframe(tbl, width="stretch")
-                    if best is not None:
-                        r = tbl.loc[best]
-                        st.success("★ 最佳進場時機：持有 **{}** 天｜勝率 {}｜平均報酬 {}｜樣本 {}"
-                                   .format(r["持有天數"], r["勝率"], r["平均報酬%"], r["樣本數"]))
-                    else:
-                        st.info("無任何持有天數樣本數≥{}，不硬推最佳（母專案同源規則）。".format(MIN_SAMPLE))
-                if fee_buy == 0 and fee_sell == 0:
-                    st.caption("ℹ️ 費用未計入（憲法「十」使用者裁決）。因回測保存原始報酬序列，"
-                               "日後要扣 {}% 前收，等價於把勝率門檻改為 ret > {}%，無需重跑。"
-                               .format("N", "N"))
 
-    # ══ Tab4：追蹤日誌 ══
-    with tabs[4]:
-        st.subheader("📒 追蹤日誌")
-        jdf = load_journal()
-        st.caption("欄位（母專案同源）：{}".format("、".join(JOURNAL_COLS)))
-        ed = st.data_editor(jdf, num_rows="dynamic", width="stretch", key="jed")
-        cc1, cc2 = st.columns(2)
-        if cc1.button("💾 儲存"):
-            st.success("已儲存") if save_journal(ed) else st.error("儲存失敗")
-        cc2.download_button("⬇️ 下載備份 CSV",
-                            ed.to_csv(index=False).encode("utf-8-sig"),
-                            "fund_journal_{}.csv".format(dt.date.today()), "text/csv")
-        st.warning("☁️ Streamlit Cloud 重啟會清空 /tmp，請定期下載備份（憲法「七」）。")
+    # ══ 同類型基金比較（同區域/資產/公司/系列 → 並排比當前跌幅+歷史勝率）══
+    with tab_cmp:
+        st.subheader("🆚 同類型基金比較")
+        st.caption("選一組同類（同區域／資產／發行公司／系列），並排比「當前滾動10日跌幅 + 各自歷史勝率」，"
+                   "找出這一類裡現在最值得進場的。")
 
-        stt = journal_stats_by_type(ed)
-        if not stt.empty:
-            st.markdown("#### 已結案實績（依進場類型分組）")
-            st.dataframe(stt, width="stretch")
-            st.info("**歸因順序（憲法「五」）**：實際低於回測時，依序排除 "
-                    "① entry_lag=0 已知偏誤 → ② 手續費未計 → ③ 配息/倖存者/跨度 → "
-                    "**④ 全排除後才可稱策略失效**。")
-
-    # ══ Tab5：系統檢核 ══
-    with tabs[5]:
-        st.subheader("🛡️ 系統檢核")
-        chk = run_system_checks(adjust, fee_buy, fee_sell, entry_lag)
-        st.dataframe(chk, width="stretch")
-        fails = chk[(chk["結果"].str.contains("FAIL")) & (chk["檢核項目"].isin(CRITICAL_CHECKS))]
-        if len(fails):
-            st.error("🚨 有 {} 項關鍵檢核未通過，結果不可信。".format(len(fails)))
+        hist_c, _ = load_history_db(None)
+        if len(hist_c) == 0:
+            st.info("尚無歷史庫，請先建庫。")
         else:
-            st.success("✅ 全部關鍵檢核通過。")
-        st.caption("CRITICAL_CHECKS 與 IMPACT_MAP 中 severity=='error' 項目自動同步（母專案架構）。")
+            g1, g2, g3 = st.columns(3)
+            g4, g5, g6 = st.columns(3)
 
-    # ══ Tab6：SITCA 連線測試（Tier2 資料源端到端驗證）══
-    with tabs[6]:
-        st.subheader("🔌 SITCA 境內基金淨值 — 連線測試")
-        st.info("**目的**：驗證「境內基金」這條資料源在 Streamlit Cloud 上端到端可用。"
-                "SITCA 是官方唯一來源，一次 POST 回一整家投信的所有基金（含主動ETF）當日淨值。"
-                "解析邏輯已用真實 VIEWSTATE 離線驗證正確，此處驗的是**真實網路連線**。")
-        if not _HAS_REQ:
-            st.error("requests 不可用，請確認 requirements.txt 含 requests。")
-        else:
-            cc1, cc2 = st.columns([2, 1])
-            comp_label = cc1.selectbox(
-                "選擇投信",
-                options=list(SITCA_COMPANIES.keys()),
-                format_func=lambda c: "{} {}".format(c, SITCA_COMPANIES[c]),
-                index=list(SITCA_COMPANIES.keys()).index("A0005"),
-            )
-            # 預設用最近一個營業日（往回跳過週末）
-            _d = dt.date.today() - dt.timedelta(days=1)
-            while _d.weekday() >= 5:
-                _d -= dt.timedelta(days=1)
-            test_date = cc2.date_input("查詢日期", value=_d)
-            date_str = test_date.strftime("%Y%m%d")
+            def _o(col, src):
+                if col not in src.columns:
+                    return ["全部"]
+                return ["全部"] + sorted([x for x in src[col].dropna().unique().tolist() if str(x).strip()])
 
-            if st.button("🔍 測試 SITCA 連線", type="primary"):
-                with st.spinner("① GET 取 token → ② POST 查詢 → ③ 解析 …"):
-                    rows, msg = fetch_sitca_nav(comp_label, date_str)
-                if rows:
-                    st.success(msg)
-                    df = pd.DataFrame(rows)
-                    n_active = int(df["分類"].str.startswith("主動ETF").sum())
-                    a, b, c = st.columns(3)
-                    a.metric("解析基金數", len(df))
-                    b.metric("其中主動ETF", n_active)
-                    c.metric("投信", SITCA_COMPANIES[comp_label])
-                    st.dataframe(df, width="stretch")
-                    st.success("✅ **SITCA 端到端可用**。境內基金資料源確認打通，"
-                               "可進入 Tier2 全市場 bulk build。請把此畫面截圖回報。")
+            vc = hist_c
+            c_reg = g1.selectbox("境內/境外", _o("境內外", vc), key="c_reg")
+            if c_reg != "全部":
+                vc = vc[vc["境內外"] == c_reg]
+            c_iss = g2.selectbox("發行公司", _o("發行", vc), key="c_iss")
+            if c_iss != "全部":
+                vc = vc[vc["發行"] == c_iss]
+            c_ser = g3.selectbox("系列", _o("系列", vc), key="c_ser")
+            if c_ser != "全部":
+                vc = vc[vc["系列"] == c_ser]
+            c_ast = g4.selectbox("資產類型", _o("資產類型", vc), key="c_ast")
+            if c_ast != "全部":
+                vc = vc[vc["資產類型"] == c_ast]
+            c_area = g5.selectbox("投資區域", _o("投資區域", vc), key="c_area")
+            if c_area != "全部":
+                vc = vc[vc["投資區域"] == c_area]
+            c_thr = g6.number_input("觸發門檻(%)", value=-10.0, step=0.5, max_value=0.0, key="c_thr")
+
+            codes = vc["代碼"].dropna().unique().tolist()
+            st.caption("篩選後 {} 檔。比較會逐檔跑歷史回測，建議 ≤ 60 檔。".format(len(codes)))
+
+            if st.button("🆚 比較這一類", type="primary"):
+                if len(codes) == 0:
+                    st.warning("沒有符合的基金，請放寬條件。")
+                elif len(codes) > 60:
+                    st.warning("這一類有 {} 檔，太多了（逐檔回測會很久）。請再用發行公司/系列/區域縮到 ≤ 60 檔。".format(len(codes)))
                 else:
-                    st.error(msg)
-                    st.caption("若失敗，請把上面紅字整段回報。依鐵律9：看確切錯誤才動手，不猜。")
-            st.caption("ℹ️ 此頁只讀取、不寫入。SITCA 資料更新頻率為每個營業日。"
-                       "假日或當日未公告時可能解析 0 筆，屬正常，換前一個營業日再試。")
+                    thr = float(c_thr)
+                    rows = []
+                    prog = st.progress(0.0)
+                    for i, code in enumerate(codes):
+                        one = hist_c[hist_c["代碼"] == code]
+                        prices = hist_to_prices(one)
+                        if len(prices) < ROLL_N + 1:
+                            continue
+                        rolling = calc_all_rolling_returns(prices, ROLL_N, max_span)
+                        if not rolling:
+                            continue
+                        last = rolling[-1]
+                        triggered = last["return"] <= thr and last["valid"]
+                        consec = 0
+                        for r in reversed(rolling):
+                            if r["return"] <= thr and r.get("valid", True):
+                                consec += 1
+                            else:
+                                break
+                        best_wr, best_h, n_hist = None, None, 0
+                        bt = run_full_backtest(prices, thr, rolling, 0, 0.0, 0.0, max_span)
+                        if bt:
+                            n_hist = bt.get("觸發次數", 0)
+                            tbl = build_entry_timing_table(bt)
+                            bi = _pick_best_timing_idx(tbl)
+                            if bi is not None:
+                                best_wr = tbl.loc[bi, "勝率"]
+                                best_h = tbl.loc[bi, "持有天數"]
+                        nm = str(one["名稱"].iloc[0]) if "名稱" in one.columns else ""
+                        ser = str(one["系列"].iloc[0]) if "系列" in one.columns else ""
+                        rows.append({
+                            "代碼": code, "名稱": nm[:36], "系列": ser,
+                            "滾動10日%": round(last["return"], 2),
+                            "今日觸發": "🔴" if triggered else "—",
+                            "連續觸發天": consec,
+                            "淨值最新日": last["date"],
+                            "歷史觸發次數": n_hist,
+                            "歷史最佳勝率": best_wr if best_wr else "—",
+                            "最佳持有天": best_h if best_h else "—",
+                            "資料品質": "✅" if last["valid"] else "⚠️稀疏",
+                        })
+                        prog.progress((i + 1) / len(codes))
+                    prog.empty()
 
+                    if not rows:
+                        st.warning("這一類沒有可比較的資料（可能淨值太少）。")
+                    else:
+                        cdf = pd.DataFrame(rows).sort_values("滾動10日%")
+                        n_trig = int((cdf["今日觸發"] == "🔴").sum())
+                        st.success("**這一類共 {} 檔，今天有 {} 檔觸發跌幅。** 表已按跌幅排序（跌最深在最上）。"
+                                   "點欄位標題可改排序（例如按『歷史最佳勝率』找高勝率的）。".format(len(cdf), n_trig))
+                        st.dataframe(cdf.reset_index(drop=True), use_container_width=True, height=560,
+                                     hide_index=True)
+                        st.download_button(
+                            "⬇️ 下載比較 CSV", cdf.to_csv(index=False).encode("utf-8-sig"),
+                            file_name="compare_{}.csv".format(dt.date.today()), mime="text/csv")
+                        st.caption("判讀：同類裡「🔴今天觸發 + 歷史最佳勝率高 + 觸發次數夠(≥10)」= 現在較值得進場。"
+                                   "勝率為觸發後最佳持有天的回測值，樣本太少不顯示。列印用 Ctrl+P。")
+
+    # ══ 筆記（手動、可下載保存；取代自動追蹤日誌）══
+    with tab_notes:
+        st.subheader("📝 筆記")
+        st.caption("寫下你的觀察與單筆記錄。Streamlit Cloud 重啟會清空，請用下載保存、下次上傳載回。")
+        if "notes_text" not in st.session_state:
+            st.session_state["notes_text"] = ""
+        _up = st.file_uploader("載入先前筆記 (.md/.txt)", type=["md", "txt"], key="notes_up")
+        if _up is not None:
+            st.session_state["notes_text"] = _up.read().decode("utf-8", errors="replace")
+        _txt = st.text_area("筆記內容", value=st.session_state["notes_text"], height=420, key="notes_area")
+        st.session_state["notes_text"] = _txt
+        st.download_button("⬇️ 下載筆記", _txt.encode("utf-8"),
+                           "fund_notes_{}.md".format(dt.date.today()), "text/markdown")
 
 if __name__ == "__main__":
     main()
