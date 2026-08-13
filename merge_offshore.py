@@ -75,6 +75,40 @@ def main():
     for fn in written:
         print("  {} → {:.1f} MB".format(fn, os.path.getsize(fn) / 1024 / 1024))
     print("合併：{} 檔基金、{:,} 筆、{} 個年度(子)檔".format(len(funds), total, len(written)))
+
+    # ── 絕對比對：cnyes 官方清單 N 檔 vs 實際建進庫 M 檔 → coverage_offshore.json ──
+    import json
+    import datetime as _dt
+    uni_files = glob.glob("_segs/*/offshore_universe.csv") + glob.glob("data/offshore_universe.csv")
+    universe = {}
+    for uf in uni_files:
+        try:
+            with open(uf, encoding="utf-8-sig", newline="") as f:
+                for r in csv.DictReader(f):
+                    c = (r.get("代碼") or "").strip()
+                    if c:
+                        universe[c] = r.get("名稱", "")
+            break
+        except Exception:
+            continue
+    cov = {
+        "date": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d"),
+        "source": "cnyes清單 vs yfinance歷史",
+        "universe_count": len(universe),          # 官方應有(cnyes 全境外類股)
+        "built_count": len(funds),                # 實際建進庫(有yfinance歷史)
+        "with_history_rate": round(len(funds) / len(universe), 4) if universe else None,
+    }
+    if universe:
+        missing = [c for c in universe if c not in funds]
+        cov["missing_count"] = len(missing)
+        cov["missing_sample"] = [{"代碼": c, "名稱": universe[c]} for c in missing[:50]]
+        print("覆蓋比對：官方 {} 檔 / 建庫 {} 檔 / 無歷史 {} 檔 ({:.0%})".format(
+            len(universe), len(funds), len(missing), cov["with_history_rate"]))
+    else:
+        print("（找不到 universe 清單，coverage 只記建庫數）")
+    with open("data/coverage_offshore.json", "w", encoding="utf-8") as f:
+        json.dump(cov, f, ensure_ascii=False, indent=2)
+    print("→ data/coverage_offshore.json 已寫入")
     print("=" * 60)
     if len(funds) < 100:
         print("❌ 只有 {} 檔，疑似大量失敗，不 commit".format(len(funds)))
