@@ -34,6 +34,24 @@ try:
 except Exception:
     _HAS_MP = False
 
+_ICONS = {
+    "sys": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 96 96\" width=\"38\" height=\"38\">  <circle cx=\"48\" cy=\"48\" r=\"45\" fill=\"none\" stroke=\"#003781\" stroke-width=\"2\"/>  <g fill=\"none\" stroke=\"#003781\" stroke-width=\"2.4\" stroke-linecap=\"round\" stroke-linejoin=\"round\">    <path d=\"M48 22 L68 29 V47 C68 61 59 70 48 75 C37 70 28 61 28 47 V29 Z\"/>    <path d=\"M40 48 L46 55 L58 41\"/  </g></svg>",
+    "scan": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 96 96\" width=\"38\" height=\"38\">  <circle cx=\"48\" cy=\"48\" r=\"45\" fill=\"none\" stroke=\"#003781\" stroke-width=\"2\"/>  <g fill=\"none\" stroke=\"#003781\" stroke-width=\"2.4\" stroke-linecap=\"round\" stroke-linejoin=\"round\">    <circle cx=\"43\" cy=\"43\" r=\"14\"/>    <path d=\"M53 53 L66 66\"/>    <path d=\"M37 43 H49 M43 37 V49\" stroke-width=\"1.8\"/  </g></svg>",
+    "fund": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 96 96\" width=\"38\" height=\"38\">  <circle cx=\"48\" cy=\"48\" r=\"45\" fill=\"none\" stroke=\"#003781\" stroke-width=\"2\"/>  <g fill=\"none\" stroke=\"#003781\" stroke-width=\"2.4\" stroke-linecap=\"round\" stroke-linejoin=\"round\">    <path d=\"M27 28 V66 H69\"/>    <path d=\"M32 58 L41 49 L49 55 L58 40\"/>    <circle cx=\"61\" cy=\"40\" r=\"6\"/>    <path d=\"M65 44 L71 50\"/  </g></svg>",
+    "cmp": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 96 96\" width=\"38\" height=\"38\">  <circle cx=\"48\" cy=\"48\" r=\"45\" fill=\"none\" stroke=\"#003781\" stroke-width=\"2\"/>  <g fill=\"none\" stroke=\"#003781\" stroke-width=\"2.4\" stroke-linecap=\"round\" stroke-linejoin=\"round\">    <path d=\"M28 66 H68\"/>    <rect x=\"33\" y=\"46\" width=\"7\" height=\"20\"/>    <rect x=\"45\" y=\"34\" width=\"7\" height=\"32\"/>    <rect x=\"57\" y=\"52\" width=\"7\" height=\"14\"/>  </g></svg>",
+    "notes": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 96 96\" width=\"38\" height=\"38\">  <circle cx=\"48\" cy=\"48\" r=\"45\" fill=\"none\" stroke=\"#003781\" stroke-width=\"2\"/>  <g fill=\"none\" stroke=\"#003781\" stroke-width=\"2.4\" stroke-linecap=\"round\" stroke-linejoin=\"round\">    <rect x=\"31\" y=\"26\" width=\"30\" height=\"44\" rx=\"3\"/>    <path d=\"M38 26 V70 M31 36 H61 M31 48 H61 M31 60 H61\" stroke-width=\"1.6\"/>    <path d=\"M55 58 L70 43 L74 47 L59 62 Z\" fill=\"#DFEFF2\"/>  </g></svg>",
+}
+
+def _icon_title(key, text):
+    """Allianz 風 icon + 標題（內嵌SVG，不依賴外部檔）。"""
+    svg = _ICONS.get(key, "")
+    st.markdown(
+        '<div style="display:flex;align-items:center;gap:10px;margin:6px 0 10px">'
+        '<span style="flex:0 0 auto;line-height:0">' + svg + '</span>'
+        '<span style="font-size:1.55rem;font-weight:700;color:#003781">' + text + '</span></div>',
+        unsafe_allow_html=True)
+
+
 # ── 選用相依（缺少時不得使 app 崩潰，繼承母專案 try/except 保護原則）──
 try:
     import yfinance as yf
@@ -1205,7 +1223,7 @@ def main():
 
     # ══ 系統檢核（資料源綠勾表 + 排程 + 邏輯檢核 + SITCA測試）══
     with tab_sys:
-        st.subheader("🛡️ 系統檢核")
+        _icon_title("sys", "系統檢核")
         st.caption("一頁看懂：資料抓齊了嗎、夠不夠新、排程有沒有掛、邏輯對不對。")
 
         _hchk, _hsrc = load_history_db(2)   # 近2年，避免全載OOM
@@ -1342,51 +1360,52 @@ def main():
             st.success("✅ 全部關鍵檢核通過。")
 
         st.markdown("---")
-        st.markdown("### 🔌 SITCA 境內連線測試")
-        st.info("**目的**：驗證「境內基金」這條資料源在 Streamlit Cloud 上端到端可用。"
-                "SITCA 是官方唯一來源，一次 POST 回一整家投信的所有基金（含主動ETF）當日淨值。"
-                "解析邏輯已用真實 VIEWSTATE 離線驗證正確，此處驗的是**真實網路連線**。")
-        if not _HAS_REQ:
-            st.error("requests 不可用，請確認 requirements.txt 含 requests。")
-        else:
-            cc1, cc2 = st.columns([2, 1])
-            comp_label = cc1.selectbox(
-                "選擇投信",
-                options=list(SITCA_COMPANIES.keys()),
-                format_func=lambda c: "{} {}".format(c, SITCA_COMPANIES[c]),
-                index=list(SITCA_COMPANIES.keys()).index("A0005"),
-            )
-            # 預設用最近一個營業日（往回跳過週末）
-            _d = dt.date.today() - dt.timedelta(days=1)
-            while _d.weekday() >= 5:
-                _d -= dt.timedelta(days=1)
-            test_date = cc2.date_input("查詢日期", value=_d)
-            date_str = test_date.strftime("%Y%m%d")
+        with st.expander("🔌 SITCA 即時連線測試（進階；雲端打SITCA會回404屬正常，僅本機診斷用）"):
+            st.caption("境內健康請看上方『資料源完整度』的新鮮度(排程有在補即正常)。此處是本機端到端診斷，雲端會失敗不代表系統壞。")
+            st.info("**目的**：驗證「境內基金」這條資料源在 Streamlit Cloud 上端到端可用。"
+                    "SITCA 是官方唯一來源，一次 POST 回一整家投信的所有基金（含主動ETF）當日淨值。"
+                    "解析邏輯已用真實 VIEWSTATE 離線驗證正確，此處驗的是**真實網路連線**。")
+            if not _HAS_REQ:
+                st.error("requests 不可用，請確認 requirements.txt 含 requests。")
+            else:
+                cc1, cc2 = st.columns([2, 1])
+                comp_label = cc1.selectbox(
+                    "選擇投信",
+                    options=list(SITCA_COMPANIES.keys()),
+                    format_func=lambda c: "{} {}".format(c, SITCA_COMPANIES[c]),
+                    index=list(SITCA_COMPANIES.keys()).index("A0005"),
+                )
+                # 預設用最近一個營業日（往回跳過週末）
+                _d = dt.date.today() - dt.timedelta(days=1)
+                while _d.weekday() >= 5:
+                    _d -= dt.timedelta(days=1)
+                test_date = cc2.date_input("查詢日期", value=_d)
+                date_str = test_date.strftime("%Y%m%d")
 
-            if st.button("🔍 測試 SITCA 連線", type="primary"):
-                with st.spinner("① GET 取 token → ② POST 查詢 → ③ 解析 …"):
-                    rows, msg = fetch_sitca_nav(comp_label, date_str)
-                if rows:
-                    st.success(msg)
-                    df = pd.DataFrame(rows)
-                    n_active = int(df["分類"].str.startswith("主動ETF").sum())
-                    a, b, c = st.columns(3)
-                    a.metric("解析基金數", len(df))
-                    b.metric("其中主動ETF", n_active)
-                    c.metric("投信", SITCA_COMPANIES[comp_label])
-                    st.dataframe(df, width="stretch")
-                    st.success("✅ **SITCA 端到端可用**。境內基金資料源確認打通，"
-                               "可進入 Tier2 全市場 bulk build。請把此畫面截圖回報。")
-                else:
-                    st.error(msg)
-                    st.caption("若失敗，請把上面紅字整段回報。依鐵律9：看確切錯誤才動手，不猜。")
-            st.caption("ℹ️ 此頁只讀取、不寫入。SITCA 資料更新頻率為每個營業日。"
-                       "假日或當日未公告時可能解析 0 筆，屬正常，換前一個營業日再試。")
+                if st.button("🔍 測試 SITCA 連線", type="primary"):
+                    with st.spinner("① GET 取 token → ② POST 查詢 → ③ 解析 …"):
+                        rows, msg = fetch_sitca_nav(comp_label, date_str)
+                    if rows:
+                        st.success(msg)
+                        df = pd.DataFrame(rows)
+                        n_active = int(df["分類"].str.startswith("主動ETF").sum())
+                        a, b, c = st.columns(3)
+                        a.metric("解析基金數", len(df))
+                        b.metric("其中主動ETF", n_active)
+                        c.metric("投信", SITCA_COMPANIES[comp_label])
+                        st.dataframe(df, width="stretch")
+                        st.success("✅ **SITCA 端到端可用**。境內基金資料源確認打通，"
+                                   "可進入 Tier2 全市場 bulk build。請把此畫面截圖回報。")
+                    else:
+                        st.error(msg)
+                        st.caption("若失敗，請把上面紅字整段回報。依鐵律9：看確切錯誤才動手，不猜。")
+                st.caption("ℹ️ 此頁只讀取、不寫入。SITCA 資料更新頻率為每個營業日。"
+                           "假日或當日未公告時可能解析 0 筆，屬正常，換前一個營業日再試。")
 
 
 
     with tab_scan:
-        st.subheader("☀️ 每早掃描 — 今天誰觸發 + 歷史勝率")
+        _icon_title("scan", "每早掃描 — 今天誰觸發 + 歷史勝率")
         depth_opt = st.radio(
             "歷史深度（資料量大，先用小範圍確保不當機）",
             ["最近2年（推薦，快）", "最近3年", "最近5年", "全部"],
@@ -1514,7 +1533,7 @@ def main():
 
 
     with tab_fund:
-        st.subheader("🔍 個別基金分析")
+        _icon_title("fund", "個別基金分析")
         st.caption("先用篩選縮小範圍→選一檔→看完整回測：勝率/報酬/累積損益/進場時機/回撤/年度/連續觸發，走勢圖在最後。")
 
         hist_a = load_fund_meta()   # 下拉用輕量metadata，不全載
@@ -1695,7 +1714,7 @@ def main():
 
     # ══ 同類型基金比較（同區域/資產/公司/系列 → 並排比當前跌幅+歷史勝率）══
     with tab_cmp:
-        st.subheader("🆚 同類型基金比較")
+        _icon_title("cmp", "同類型基金比較")
         st.caption("選一組同類（同區域／資產／發行公司／系列），並排比「當前滾動10日跌幅 + 各自歷史勝率」，"
                    "找出這一類裡現在最值得進場的。")
 
@@ -1801,7 +1820,7 @@ def main():
 
     # ══ 筆記（手動、可下載保存；取代自動追蹤日誌）══
     with tab_notes:
-        st.subheader("📝 筆記")
+        _icon_title("notes", "筆記")
         st.caption("寫下你的觀察與單筆記錄。Streamlit Cloud 重啟會清空，請用下載保存、下次上傳載回。")
         if "notes_text" not in st.session_state:
             st.session_state["notes_text"] = ""
