@@ -458,6 +458,45 @@ def hist_to_prices(df_one: pd.DataFrame) -> Dict[str, float]:
     return dict(zip(d["日期"].astype(str), d["淨值"].astype(float)))
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def load_prices_for_codes(codes_tuple):
+    """★低記憶體：只讀指定基金代碼的全歷史淨值（不載整個庫，避免OOM）。
+    回 {code: {日期:淨值}}。逐檔案讀→過濾→只留這些代碼，峰值≈單一檔案。"""
+    import glob as _g
+    want = set(codes_tuple)
+    out: Dict[str, Dict[str, float]] = {}
+    files = sorted(_g.glob("data/sitca_nav_*.csv")) + sorted(_g.glob("data/offshore_nav_*.csv"))
+    for fp in files:
+        try:
+            df = pd.read_csv(fp, dtype=str, usecols=lambda c: c in ("代碼", "日期", "淨值"))
+        except Exception:
+            continue
+        if "代碼" not in df.columns:
+            continue
+        df = df[df["代碼"].isin(want)]
+        if len(df) == 0:
+            continue
+        df["淨值"] = pd.to_numeric(df["淨值"], errors="coerce")
+        df = df.dropna(subset=["淨值"])
+        for code, g in df.groupby("代碼"):
+            out.setdefault(str(code), {}).update(
+                dict(zip(g["日期"].astype(str), g["淨值"].astype(float))))
+    return out
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_fund_meta():
+    """★低記憶體：基金清單 metadata（代碼/名稱/境內外/發行/系列/資產/區域），
+    給篩選下拉用，不載每日淨值。用近2年檔去重出每檔一列。"""
+    h, _ = load_history_db(2)
+    if len(h) == 0:
+        return pd.DataFrame(columns=["代碼", "名稱", "境內外", "發行", "系列",
+                                     "資產類型", "投資區域"])
+    keep = [c for c in ["代碼", "名稱", "境內外", "發行", "系列", "資產類型", "投資區域"]
+            if c in h.columns]
+    return h[keep].drop_duplicates("代碼").reset_index(drop=True)
+
+
 # ══════════════════════════════════════════════════════════════
 # 即時補最新（PENDING#1，Greg 選 A：app 掃描前即時抓，境內拿今天）
 #   目的：靜態庫最新日 = 上次建庫時間；掃描前即時抓「庫最新日之後~今天」的
@@ -1169,7 +1208,7 @@ def main():
         st.subheader("🛡️ 系統檢核")
 
         st.markdown("### 📊 資料源與完整度（即時）")
-        _hchk, _hsrc = load_history_db(None)
+        _hchk, _hsrc = load_history_db(2)   # 狀態用近2年，避免全載OOM
         if len(_hchk):
             _dom = _hchk[_hchk["境內外"] == "境內"]
             _off = _hchk[_hchk["境內外"] == "境外"]
@@ -1378,7 +1417,7 @@ def main():
         st.subheader("🔍 個別基金分析")
         st.caption("先用篩選縮小範圍→選一檔→看完整回測：勝率/報酬/累積損益/進場時機/回撤/年度/連續觸發，走勢圖在最後。")
 
-        hist_a, hsrc_a = load_history_db(None)
+        hist_a = load_fund_meta()   # 下拉用輕量metadata，不全載
         if len(hist_a) == 0:
             st.info("尚無歷史庫，請先用 GitHub Actions 建庫。")
         elif not _HAS_MP:
@@ -1425,8 +1464,7 @@ def main():
 
                 if st.button("🔍 分析這檔", type="primary"):
                     code_a = lab2code[pick_lab]
-                    one = hist_a[hist_a["代碼"] == code_a]
-                    prices = hist_to_prices(one)
+                    prices = load_prices_for_codes((code_a,)).get(code_a, {})
                     if len(prices) < 30:
                         st.error("這檔可用淨值太少（{}筆），無法回測。".format(len(prices)))
                     else:
@@ -1561,7 +1599,7 @@ def main():
         st.caption("選一組同類（同區域／資產／發行公司／系列），並排比「當前滾動10日跌幅 + 各自歷史勝率」，"
                    "找出這一類裡現在最值得進場的。")
 
-        hist_c, _ = load_history_db(None)
+        hist_c = load_fund_meta()   # 下拉用輕量metadata，不全載
         if len(hist_c) == 0:
             st.info("尚無歷史庫，請先建庫。")
         else:
@@ -1602,10 +1640,11 @@ def main():
                 else:
                     thr = float(c_thr)
                     rows = []
+                    _pmap = load_prices_for_codes(tuple(codes))   # 只讀這組基金，不全載
+                    _meta = vc.drop_duplicates("代碼").set_index("代碼")
                     prog = st.progress(0.0)
                     for i, code in enumerate(codes):
-                        one = hist_c[hist_c["代碼"] == code]
-                        prices = hist_to_prices(one)
+                        prices = _pmap.get(code, {})
                         if len(prices) < ROLL_N + 1:
                             continue
                         rolling = calc_all_rolling_returns(prices, ROLL_N, max_span)
@@ -1628,8 +1667,9 @@ def main():
                             if bi is not None:
                                 best_wr = tbl.loc[bi, "勝率"]
                                 best_h = tbl.loc[bi, "持有天數"]
-                        nm = str(one["名稱"].iloc[0]) if "名稱" in one.columns else ""
-                        ser = str(one["系列"].iloc[0]) if "系列" in one.columns else ""
+                        _row = _meta.loc[code] if code in _meta.index else None
+                        nm = str(_row["名稱"]) if _row is not None and "名稱" in _meta.columns else ""
+                        ser = str(_row["系列"]) if _row is not None and "系列" in _meta.columns else ""
                         rows.append({
                             "代碼": code, "名稱": nm[:36], "系列": ser,
                             "滾動10日%": round(last["return"], 2),
