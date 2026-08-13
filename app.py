@@ -1203,32 +1203,136 @@ def main():
     tab_sys, tab_scan, tab_fund, tab_cmp, tab_notes = st.tabs(
         ["🛡️ 系統檢核", "☀️ 每早掃描", "🔍 個別基金分析", "🆚 同類型比較", "📝 筆記"])
 
-    # ══ 系統檢核（狀態 + 檢核 + SITCA連線測試，合併）══
+    # ══ 系統檢核（資料源綠勾表 + 排程 + 邏輯檢核 + SITCA測試）══
     with tab_sys:
         st.subheader("🛡️ 系統檢核")
+        st.caption("一頁看懂：資料抓齊了嗎、夠不夠新、排程有沒有掛、邏輯對不對。")
 
-        st.markdown("### 📊 資料源與完整度（即時）")
-        _hchk, _hsrc = load_history_db(2)   # 狀態用近2年，避免全載OOM
+        _hchk, _hsrc = load_history_db(2)   # 近2年，避免全載OOM
+        _today = dt.date.today()
+
+        def _days_since(dstr):
+            try:
+                return (_today - dt.date.fromisoformat(str(dstr)[:10])).days
+            except Exception:
+                return 999
+
+        # ── 表1：資料源完整度（應該有/實際/結果）──
+        st.markdown("### 📊 資料源完整度")
+        rows = []
+        # 境內：SITCA 是唯一源=我們抓的，無來源缺口；檢核『新鮮度』
         if len(_hchk):
             _dom = _hchk[_hchk["境內外"] == "境內"]
             _off = _hchk[_hchk["境內外"] == "境外"]
-            _q1, _q2, _q3, _q4 = st.columns(4)
-            _q1.metric("境內基金", "{:,}".format(_dom["代碼"].nunique()))
-            _q2.metric("境外基金", "{:,}".format(_off["代碼"].nunique()))
-            _q3.metric("總淨值筆數", "{:,}".format(len(_hchk)))
-            _dl = _dom["日期"].max() if len(_dom) else "-"
-            _ol = _off["日期"].max() if len(_off) else "-"
-            _q4.metric("境內最新日", str(_dl))
-            st.info("境內最新淨值日 **{}**｜境外最新淨值日 **{}**（境外有時差，通常慢1–2天）。"
-                    "資料源：{}".format(_dl, _ol, " + ".join(_hsrc)))
+            dom_n = _dom["代碼"].nunique()
+            off_n = _off["代碼"].nunique()
+            dl = str(_dom["日期"].max())[:10] if len(_dom) else "-"
+            ol = str(_off["日期"].max())[:10] if len(_off) else "-"
+            dgap = _days_since(dl)
+            ogap = _days_since(ol)
+            rows.append({"資料源": "境內 SITCA", "應該有": "SITCA全市場(唯一源=即抓即建)",
+                         "實際抓到": "{:,} 檔".format(dom_n),
+                         "最新日": dl, "距今": "{} 天".format(dgap),
+                         "結果": "✅ 正常" if dgap <= 4 else "🔴 逾 {} 天未更新".format(dgap)})
         else:
-            st.warning("歷史庫尚未載入，請先建庫。")
-        st.markdown("**排程狀態**：GitHub → Actions 看『每日補最新 SITCA 淨值』(境內每日) 與 "
-                    "『建置 境外基金淨值庫』(境外每日) 是否綠燈。偶爾一天紅(假日)免理；連續紅才需處理。")
-        st.markdown("---")
+            off_n = 0
+        # 境外：讀建庫寫的 coverage_offshore.json（絕對比對，含新基金漏抓）
+        cov = None
+        try:
+            import json as _json
+            with open("data/coverage_offshore.json", encoding="utf-8") as f:
+                cov = _json.load(f)
+        except Exception:
+            cov = None
+        if cov:
+            uni = cov.get("universe_count", 0)
+            blt = cov.get("built_count", 0)
+            miss = cov.get("missing_count", 0)
+            rate = cov.get("with_history_rate")
+            ok = (rate is not None and rate >= 0.55)
+            rows.append({"資料源": "境外 cnyes+yfinance",
+                         "應該有": "{:,} 檔(cnyes官方清單)".format(uni),
+                         "實際抓到": "{:,} 檔有歷史".format(blt),
+                         "最新日": (ol if len(_hchk) else "-"),
+                         "距今": "建庫日 {}".format(cov.get("date", "-")),
+                         "結果": "✅ 覆蓋 {:.0%}".format(rate) if ok else "⚠️ 覆蓋僅 {:.0%}".format(rate or 0)})
+        else:
+            rows.append({"資料源": "境外 cnyes+yfinance", "應該有": "待建庫產生 coverage",
+                         "實際抓到": "{:,} 檔".format(off_n), "最新日": "-", "距今": "-",
+                         "結果": "⚠️ 尚無 coverage_offshore.json（跑一次境外建庫即產生）"})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        if cov and cov.get("missing_count"):
+            with st.expander("🔍 境外無歷史清單（可能含新上市基金，共 {} 檔）".format(cov["missing_count"])):
+                st.caption("這些 cnyes 有列、但 yfinance 抓不到歷史（多為非美元平行類股）。若見到你想追的新基金，跟我說補救。")
+                st.dataframe(pd.DataFrame(cov.get("missing_sample", [])), use_container_width=True, hide_index=True)
+        st.caption("資料源：{}".format(_hsrc))   # ← 修正：_hsrc 本身已是字串，不再逐字加號
 
-        st.markdown("### ✅ 邏輯檢核")
-        st.subheader("🛡️ 系統檢核")
+        # ── 境內完整度說明：判斷要不要補境內 ──
+        with st.expander("📖 境內完整度說明：之後要不要補境內？（點開看）"):
+            st.markdown(
+                "**境內的缺口不在「基金」，在「投信公司」。**\n\n"
+                "- 境內唯一源是 **SITCA 官方**，我們抓的＝SITCA 有的 → **沒有來源缺口**。\n"
+                "- **同一家投信底下的新基金** → 每日排程自動補進來，**你什麼都不用做**。\n"
+                "- **真正可能漏的是「投信公司」**：系統只查下面清單裡的 **{} 家投信**。"
+                "若台灣有**新設投信不在清單內**，那家的基金會整批抓不到。\n\n"
+                "**所以「要不要補境內」＝「有沒有投信不在我們清單裡」。** "
+                "判斷法：若你發現某境內基金/某新投信在 app 裡找不到 → 把**那家投信名稱**告訴我，"
+                "我把它的代碼加進 `SITCA_COMPANIES`，下次排程就會納入。".format(len(SITCA_COMPANIES)))
+            _cl = ["{} {}".format(c, n) for c, n in sorted(SITCA_COMPANIES.items())]
+            st.markdown("**目前納入的 {} 家投信：**".format(len(SITCA_COMPANIES)))
+            st.dataframe(pd.DataFrame({"投信": _cl}), use_container_width=True,
+                         hide_index=True, height=240)
+            st.caption("台灣投信約 39~40 家；若此清單少於實際家數，缺的那幾家就是要補的。"
+                       "境外則相反：清單齊全，缺的是 yfinance 歷史（見上表覆蓋率）。")
+
+        # ── 表2：資料品質 ──
+        st.markdown("### 🧪 資料品質")
+        qrows = []
+        if len(_hchk):
+            for reg, g in [("境內", _dom), ("境外", _off)]:
+                if len(g) == 0:
+                    continue
+                yrs = sorted(set(str(x)[:4] for x in g["日期"].dropna()))
+                qrows.append({"範圍": reg, "涵蓋年度": "{}~{}".format(yrs[0], yrs[-1]) if yrs else "-",
+                              "年數": len(yrs), "檔數": g["代碼"].nunique(),
+                              "近2年筆數": "{:,}".format(len(g))})
+            st.dataframe(pd.DataFrame(qrows), use_container_width=True, hide_index=True)
+        st.caption("境內≈統一往回9年；境外=各檔成立至今(老基金十餘年、新基金2~4年)。回測自動用各檔全歷史。")
+
+        # ── 表3：排程狀態（抓 GitHub Actions API）──
+        st.markdown("### ⏰ 排程狀態")
+        if st.button("🔄 檢查排程最近執行結果"):
+            import json as _json
+            import urllib.request as _u
+            wf = {"每日補最新 SITCA(境內)": "topup_daily.yml",
+                  "建置境外基金庫(境外)": "build_offshore.yml"}
+            srows = []
+            for label, yml in wf.items():
+                try:
+                    url = ("https://api.github.com/repos/jojo164164/fund-tier1/actions/"
+                           "workflows/{}/runs?per_page=1".format(yml))
+                    req = _u.Request(url, headers={"User-Agent": "fund-tier1"})
+                    with _u.urlopen(req, timeout=15) as r:
+                        d = _json.load(r)
+                    runs = d.get("workflow_runs", [])
+                    if runs:
+                        rr = runs[0]
+                        concl = rr.get("conclusion") or rr.get("status")
+                        when = (rr.get("updated_at") or "")[:10]
+                        srows.append({"排程": label, "最近結果": concl, "時間": when,
+                                      "狀態": "✅" if concl == "success" else "🔴 " + str(concl)})
+                    else:
+                        srows.append({"排程": label, "最近結果": "無紀錄", "時間": "-", "狀態": "⚠️"})
+                except Exception as e:
+                    srows.append({"排程": label, "最近結果": "查詢失敗", "時間": "-",
+                                  "狀態": "⚠️ {}".format(type(e).__name__)})
+            st.dataframe(pd.DataFrame(srows), use_container_width=True, hide_index=True)
+            st.caption("GitHub 匿名 API 每小時限 60 次，偶爾查不到屬正常。連續🔴才需處理。")
+        else:
+            st.caption("按上方按鈕即時查境內每日/境外每日排程的最近成敗（走 GitHub API）。")
+
+        st.markdown("---")
+        st.markdown("### ✅ 邏輯檢核（憲法鐵律自我驗證）")
         chk = run_system_checks(adjust, fee_buy, fee_sell, entry_lag)
         st.dataframe(chk, width="stretch")
         fails = chk[(chk["結果"].str.contains("FAIL")) & (chk["檢核項目"].isin(CRITICAL_CHECKS))]
@@ -1236,13 +1340,9 @@ def main():
             st.error("🚨 有 {} 項關鍵檢核未通過，結果不可信。".format(len(fails)))
         else:
             st.success("✅ 全部關鍵檢核通過。")
-        st.caption("CRITICAL_CHECKS 與 IMPACT_MAP 中 severity=='error' 項目自動同步（母專案架構）。")
-
-    # ══ Tab6：SITCA 連線測試（Tier2 資料源端到端驗證）══
 
         st.markdown("---")
         st.markdown("### 🔌 SITCA 境內連線測試")
-        st.subheader("🔌 SITCA 境內基金淨值 — 連線測試")
         st.info("**目的**：驗證「境內基金」這條資料源在 Streamlit Cloud 上端到端可用。"
                 "SITCA 是官方唯一來源，一次 POST 回一整家投信的所有基金（含主動ETF）當日淨值。"
                 "解析邏輯已用真實 VIEWSTATE 離線驗證正確，此處驗的是**真實網路連線**。")
