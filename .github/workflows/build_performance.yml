@@ -1,0 +1,30 @@
+name: 建置 基金績效Ranking (MoneyDJ)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 15 * * 1-5'   # 週一~五 台北 23:00（接在NAV建庫後）
+
+permissions:
+  contents: write
+
+jobs:
+  perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: pip install requests pandas lxml html5lib
+      - name: 抓 MoneyDJ 績效+排名
+        run: python -u build_performance.py
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/performance.csv
+          git diff --staged --quiet || git commit -m "更新基金績效Ranking (MoneyDJ) $(date +%F)"
+          git push
