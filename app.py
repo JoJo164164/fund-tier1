@@ -524,6 +524,36 @@ def load_fund_meta():
     return h[keep].drop_duplicates("代碼").reset_index(drop=True)
 
 
+def _norm_name(s):
+    """基金名正規化（與 build_performance 同邏輯，給績效 join 用）。"""
+    s = str(s)
+    for ch in [" ", "\u3000", "\t", "(", ")", "（", "）", "-", "－"]:
+        s = s.replace(ch, "")
+    return s.strip()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_performance():
+    """讀 MoneyDJ 官方績效 → (DataFrame, {正規名: dict})。無檔則回空。"""
+    import os
+    if not os.path.exists("data/performance.csv"):
+        return pd.DataFrame(), {}
+    try:
+        p = pd.read_csv("data/performance.csv", dtype=str)
+    except Exception:
+        return pd.DataFrame(), {}
+    numc = ["排名", "一個月%", "三個月%", "六個月%", "一年%", "三年%",
+            "五年%", "十年%", "年化標準差", "Sharpe", "Beta"]
+    for c in numc:
+        if c in p.columns:
+            p[c] = pd.to_numeric(p[c], errors="coerce")
+    key = "_正規名" if "_正規名" in p.columns else "名稱"
+    lut = {}
+    for _, r in p.iterrows():
+        lut[str(r[key])] = r.to_dict()
+    return p, lut
+
+
 # ══════════════════════════════════════════════════════════════
 # 即時補最新（PENDING#1，Greg 選 A：app 掃描前即時抓，境內拿今天）
 #   目的：靜態庫最新日 = 上次建庫時間；掃描前即時抓「庫最新日之後~今天」的
@@ -1244,8 +1274,9 @@ def main():
 
     threshold = -10.0  # 各 tab 內可各自調整
 
-    tab_sys, tab_scan, tab_fund, tab_cmp, tab_notes = st.tabs(
-        ["🛡️ 系統檢核", "☀️ 每早掃描", "🔍 個別基金分析", "🆚 同類型比較", "📝 筆記"])
+    tab_sys, tab_scan, tab_fund, tab_cmp, tab_rank, tab_notes = st.tabs(
+        ["🛡️ 系統檢核", "☀️ 每早掃描", "🔍 個別基金分析", "🆚 同類型比較",
+         "🏆 績效Ranking", "📝 筆記"])
 
     # ══ 系統檢核（資料源綠勾表 + 排程 + 邏輯檢核 + SITCA測試）══
     with tab_sys:
@@ -1615,6 +1646,24 @@ def main():
                     else:
                         thr = float(thr_a)
                         HZ = mp.HORIZONS
+
+                        # 🏅 官方績效卡（MoneyDJ，用名稱 join）
+                        _pname = pick_lab.split("  (")[0]
+                        _, _plut = load_performance()
+                        _pf = _plut.get(_norm_name(_pname))
+                        if _pf:
+                            _icon_title("cmp", "官方績效（MoneyDJ）")
+                            pc = st.columns(4)
+                            pc[0].metric("一年報酬", "{}%".format(_pf.get("一年%")) if pd.notna(_pf.get("一年%")) else "—")
+                            pc[1].metric("三年報酬", "{}%".format(_pf.get("三年%")) if pd.notna(_pf.get("三年%")) else "—")
+                            pc[2].metric("Sharpe", _pf.get("Sharpe") if pd.notna(_pf.get("Sharpe")) else "—")
+                            pc[3].metric("同類排名", "第 {} 名".format(int(_pf["排名"])) if pd.notna(_pf.get("排名")) else "—")
+                            _pr = {k: _pf.get(k) for k in ["一個月%", "三個月%", "六個月%", "一年%", "三年%", "五年%", "十年%"] if pd.notna(_pf.get(k))}
+                            if _pr:
+                                st.caption("官方各期報酬：" + "｜".join("{} {}%".format(k.replace("%", ""), v) for k, v in _pr.items())
+                                           + "（來源 MoneyDJ，考慮配息）")
+                            st.markdown("---")
+
                         win_df, avg_df, dd_df = mp.build_summary_tables(prices)
 
                         def _style_win(df):
@@ -1786,6 +1835,7 @@ def main():
                     thr = float(c_thr)
                     rows = []
                     _pmap = load_prices_for_codes(tuple(codes))   # 只讀這組基金，不全載
+                    _, _cmp_plut = load_performance()              # 官方績效 join 用
                     _meta = vc.drop_duplicates("代碼").set_index("代碼")
                     prog = st.progress(0.0)
                     for i, code in enumerate(codes):
@@ -1815,15 +1865,19 @@ def main():
                         _row = _meta.loc[code] if code in _meta.index else None
                         nm = str(_row["名稱"]) if _row is not None and "名稱" in _meta.columns else ""
                         ser = str(_row["系列"]) if _row is not None and "系列" in _meta.columns else ""
+                        _pf = _cmp_plut.get(_norm_name(nm), {})
                         rows.append({
                             "代碼": code, "名稱": nm[:36], "系列": ser,
                             "滾動10日%": round(last["return"], 2),
                             "今日觸發": "🔴" if triggered else "—",
                             "連續觸發天": consec,
-                            "淨值最新日": last["date"],
-                            "歷史觸發次數": n_hist,
+                            "官方一年%": _pf.get("一年%"),
+                            "官方三年%": _pf.get("三年%"),
+                            "官方Sharpe": _pf.get("Sharpe"),
+                            "官方排名": _pf.get("排名"),
                             "歷史最佳勝率": best_wr if best_wr else "—",
                             "最佳持有天": best_h if best_h else "—",
+                            "淨值最新日": last["date"],
                             "資料品質": "✅" if last["valid"] else "⚠️稀疏",
                         })
                         prog.progress((i + 1) / len(codes))
@@ -1843,6 +1897,49 @@ def main():
                             file_name="compare_{}.csv".format(dt.date.today()), mime="text/csv")
                         st.caption("判讀：同類裡「🔴今天觸發 + 歷史最佳勝率高 + 觸發次數夠(≥10)」= 現在較值得進場。"
                                    "勝率為觸發後最佳持有天的回測值，樣本太少不顯示。列印用 Ctrl+P。")
+
+    # ══ 績效 Ranking（MoneyDJ 官方報酬/風險/排名）══
+    with tab_rank:
+        _icon_title("cmp", "績效 Ranking（MoneyDJ 官方）")
+        st.caption("官方報酬(1M~10Y) + 風險(境外含標準差/Sharpe/Beta) + 官方排名。"
+                   "來源：MoneyDJ FundDJ，考慮配息、原幣別。")
+        perf_df, _ = load_performance()
+        if len(perf_df) == 0:
+            st.info("尚無績效資料。請先在 GitHub Actions 跑「建置 基金績效Ranking」產生 data/performance.csv。")
+        else:
+            r1, r2, r3 = st.columns(3)
+            reg = r1.selectbox("境內/境外", ["全部", "境內", "境外"], key="rk_reg")
+            v = perf_df
+            if reg != "全部" and "_境內外" in v.columns:
+                v = v[v["_境內外"] == reg]
+            comp_opts = ["全部"] + sorted([x for x in v["公司"].dropna().unique().tolist() if str(x).strip()]) if "公司" in v.columns else ["全部"]
+            comp = r2.selectbox("基金公司", comp_opts, key="rk_comp")
+            if comp != "全部":
+                v = v[v["公司"] == comp]
+            period = r3.selectbox("排序期間", ["一年%", "六個月%", "三個月%", "一個月%",
+                                             "三年%", "五年%", "十年%", "Sharpe"], key="rk_period")
+            area_opts = ["全部"] + sorted([x for x in v["投資區域"].dropna().unique().tolist() if str(x).strip()]) if "投資區域" in v.columns else ["全部"]
+            area = st.selectbox("投資區域", area_opts, key="rk_area")
+            if area != "全部":
+                v = v[v["投資區域"] == area]
+
+            show_cols = [c for c in ["名稱", "公司", "_境內外", "投資區域",
+                                     "一個月%", "三個月%", "六個月%", "一年%", "三年%",
+                                     "五年%", "十年%", "年化標準差", "Sharpe", "Beta",
+                                     "淨值日期"] if c in v.columns]
+            vv = v[show_cols].copy()
+            if period in vv.columns:
+                vv = vv.sort_values(period, ascending=False, na_position="last")
+            vv = vv.reset_index(drop=True)
+            vv.insert(0, "名次", range(1, len(vv) + 1))
+            st.success("**{} 檔**（依 {} 由高到低）。點欄位標題可改排序。".format(len(vv), period))
+            colcfg = {c: st.column_config.NumberColumn(c, format="%.2f")
+                      for c in vv.columns if c.endswith("%") or c in ("Sharpe", "Beta", "年化標準差")}
+            st.dataframe(vv, use_container_width=True, height=600, hide_index=True,
+                         column_config=colcfg)
+            st.download_button("⬇️ 下載 CSV", vv.to_csv(index=False).encode("utf-8-sig"),
+                               file_name="ranking_{}.csv".format(dt.date.today()), mime="text/csv")
+            st.caption("境內依類型頁僅提供報酬(無風險指標)；境外含完整風險。列印 Ctrl+P。")
 
     # ══ 筆記（手動、可下載保存；取代自動追蹤日誌）══
     with tab_notes:
