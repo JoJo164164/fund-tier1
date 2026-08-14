@@ -431,7 +431,8 @@ def load_history_db(max_years: Optional[int] = None) -> Tuple[pd.DataFrame, str]
         n_off = 0
         for path in off_files:
             try:
-                want = ["代碼", "日期", "淨值", "名稱", "來源", "資產類型", "投資區域"]
+                want = ["代碼", "日期", "淨值", "名稱", "來源", "資產類型",
+                        "投資區域", "發行", "系列"]
                 head = pd.read_csv(path, nrows=0)
                 use = [c for c in want if c in head.columns]
                 df = pd.read_csv(path, dtype=str, usecols=use)
@@ -440,12 +441,19 @@ def load_history_db(max_years: Optional[int] = None) -> Tuple[pd.DataFrame, str]
                 df["淨值"] = pd.to_numeric(df["淨值"], errors="coerce")
                 df = df.dropna(subset=["淨值"])
                 df["境內外"] = "境外"
-                # 發行公司：基金名 → 品牌 → 官方總代理『代碼 名稱』（與境內同表收斂）
+                # 發行/系列：優先用 CSV 官方值(TDCC ISIN)，空的才用基金名備援
                 _names = df["名稱"].astype(str)
-                _uniq = {nm: _canonical_issuer(nm, True) for nm in _names.unique()}
-                df["發行"] = _names.map(_uniq)
-                _useries = {nm: _series_from(nm, True) for nm in _names.unique()}
-                df["系列"] = _names.map(_useries)
+                _fb_iss = {nm: _canonical_issuer(nm, True) for nm in _names.unique()}
+                _fb_ser = {nm: _series_from(nm, True) for nm in _names.unique()}
+                if "發行" not in df.columns:
+                    df["發行"] = ""
+                if "系列" not in df.columns:
+                    df["系列"] = ""
+                _iss = df["發行"].fillna("").astype(str).tolist()
+                _ser = df["系列"].fillna("").astype(str).tolist()
+                _nl = _names.tolist()
+                df["發行"] = [a if a.strip() else _fb_iss.get(n, "") for a, n in zip(_iss, _nl)]
+                df["系列"] = [a if a.strip() else _fb_ser.get(n, "") for a, n in zip(_ser, _nl)]
                 for c in ["資產類型", "投資區域"]:
                     if c not in df.columns:
                         df[c] = "未分類"
