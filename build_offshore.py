@@ -27,8 +27,8 @@ except ImportError:
 
 DATA_DIR = "data"
 UNIVERSE_CSV = os.path.join(DATA_DIR, "offshore_universe.csv")
-NAV_COLS = ["代碼", "日期", "淨值", "幣別", "名稱", "來源", "資產類型", "投資區域"]
-UNI_COLS = ["代碼", "0P", "isin", "名稱", "幣別", "投資區域", "資產類型"]
+NAV_COLS = ["代碼", "日期", "淨值", "幣別", "名稱", "來源", "資產類型", "投資區域", "發行", "系列"]
+UNI_COLS = ["代碼", "0P", "isin", "名稱", "幣別", "投資區域", "資產類型", "發行", "系列"]
 
 LIST = "https://fund.api.cnyes.com/fund/api/v2/search/fund"
 H = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -58,7 +58,113 @@ def classify_asset(name, cat):
     return "未分類"
 
 
+
+# ── TDCC 官方 ISIN→(總代理,機構) 對照（鐵律32：權威源，不猜品牌）──
+TDCC_URL = "https://opendata.tdcc.com.tw/getOD.ashx?id=3-4"
+
+_INST2BRAND = [
+    ("BNY MELLON","紐約梅隆"),("紐約梅隆","紐約梅隆"),("FRANKLIN","富蘭克林"),("TEMPLETON","富蘭克林"),
+    ("富蘭克林","富蘭克林"),("坦伯頓","富蘭克林"),("ALLIANZ","安聯"),("安聯","安聯"),
+    ("EURIZON","歐義銳榮"),("歐義銳榮","歐義銳榮"),("BLACKROCK","貝萊德"),("貝萊德","貝萊德"),
+    ("SCHRODER","施羅德"),("施羅德","施羅德"),("INVESCO","景順"),("景順","景順"),
+    ("JPMORGAN","摩根"),("J.P. MORGAN","摩根"),("FIDELITY","富達"),("FIL ","富達"),("富達","富達"),
+    ("PIMCO","品浩"),("品浩","品浩"),("GOLDMAN","高盛"),("NINETY ONE","晉達"),("晉達","晉達"),
+    ("JANUS","駿利亨德森"),("駿利","駿利亨德森"),("ROBECO","荷寶"),("荷寶","荷寶"),
+    ("LION GLOBAL","利安資金"),("利安","利安資金"),("ABRDN","安本"),("安本","安本"),
+    ("MANULIFE","宏利"),("宏利","宏利"),("AMUNDI","東方匯理"),("東方匯理","東方匯理"),("鋒裕","東方匯理"),
+    ("DWS","DWS"),("德意志","DWS"),("NEUBERGER","路博邁"),("路博邁","路博邁"),
+    ("MFS","MFS"),("PINEBRIDGE","柏瑞"),("柏瑞","柏瑞"),("NATIXIS","法盛"),("法盛","法盛"),
+    ("BNP PARIBAS","法巴"),("法國巴黎","法巴"),("PICTET","百達"),("百達","百達"),
+    ("BARING","霸菱"),("霸菱","霸菱"),("MUZINICH","Muzinich"),("VALUE PARTNERS","惠理"),("惠理","惠理"),
+    ("AXA","安盛"),("M&G","M&G"),("JUPITER","木星"),("T. ROWE","普徕仕"),("普徕仕","普徕仕"),
+    ("UBP","瑞聯"),("LOMBARD ODIER","瑞士隆奧"),("FIRST SENTIER","首源"),
+    ("MSIM","摩根士丹利"),("MORGAN STANLEY","摩根士丹利"),("PGIM","保德信"),("GAM","GAM"),
+    ("KBI","KBI"),("THORNBURG","尚渤"),("UOB","新加坡大華"),("VONTOBEL","Vontobel"),
+    ("CAPITAL INTERNATIONAL","資本集團"),("資本國際","資本集團"),
+    ("FUNDROCK","FundRock(野村愛爾蘭系列)"),("HSBC","匯豐"),("匯豐","匯豐"),("UBS","瑞銀"),("瑞銀","瑞銀"),
+]
+# 總代理名關鍵字 → (代碼, 顯示名)；投顧併投信規則已內含
+_AGENT_KW = [
+    ("合作金庫",("A0048","合庫投信")),("合庫",("A0048","合庫投信")),("野村",("A0032","野村投信")),
+    ("富蘭克林",("A0045","富蘭克林華美投信")),("國泰",("A0037","國泰投信")),("永豐",("A0025","永豐投信")),
+    ("第一金",("A0003","第一金投信")),("匯豐",("A0004","匯豐投信")),("滙豐",("A0004","匯豐投信")),
+    ("景順",("A0006","景順投信")),("瀚亞",("A0007","瀚亞投信")),("玉山",("A0008","玉山投信")),
+    ("摩根",("A0011","摩根投信")),("瑞銀",("A0015","瑞銀投信")),("台中銀",("A0017","台中銀投信")),
+    ("聯博",("A0018","聯博投信")),("柏瑞",("A0021","柏瑞投信")),("中國信託",("A0026","中國信託投信")),
+    ("宏利",("A0027","宏利投信")),("貝萊德",("A0031","貝萊德投信")),("東方匯理",("A0035","東方匯理投信")),
+    ("安聯",("A0036","安聯投信")),("富達",("A0038","富達投信")),("德銀",("A0040","德銀遠東投信")),
+    ("施羅德",("A0042","施羅德投信")),("台新",("A0047","台新投信")),("大華銀",("A0049","大華銀投信")),
+    ("路博邁",("A0050","路博邁投信")),("康和",("B0015","康和投顧")),("萬寶",("B0034","萬寶投顧")),
+    ("宏遠",("B0044","宏遠投顧")),("法銀巴黎",("B0049","法銀巴黎投顧")),("霸菱",("B0149","霸菱投顧")),
+    ("全球證券",("B0162","全球投顧")),("富盛",("B0313","富盛投顧")),("百達",("B0328","百達投顧")),
+    ("品浩",("B0351","品浩太平洋投顧")),("展新",("B0355","展新投顧")),
+]
+
+
+def _clean_series(inst):
+    if not inst:
+        return ""
+    up = inst.upper()
+    brand = None
+    for kw, zh in _INST2BRAND:
+        if kw.upper() in up:
+            brand = zh; break
+    if not brand:
+        brand = inst.split("/")[0].strip()[:6] or inst[:6]
+    import re as _re
+    m = _re.search(r"[(（]([A-Za-z][A-Za-z0-9 ]{1,10})[)）]", inst)
+    if m and brand != "FundRock(野村愛爾蘭系列)":
+        suf = m.group(1).strip()
+        if suf.upper() not in ("LUXEMBOURG", "IRELAND", "UK", "EUROPE"):
+            brand = brand + suf.upper()
+    return brand
+
+
+def _resolve_agent(agent_raw):
+    if not agent_raw:
+        return ""
+    for kw, (code, nm) in _AGENT_KW:
+        if kw in agent_raw:
+            return "{} {}".format(code, nm)
+    return agent_raw.replace("證券投資信託股份有限公司", "投信").replace(
+        "證券投資顧問股份有限公司", "投顧")[:12]
+
+
+def fetch_tdcc_isin_map():
+    """抓 TDCC 官方 → {ISIN大寫: (發行公司='代碼 名稱', 系列)}。失敗回空(不擋建庫)。"""
+    out = {}
+    try:
+        r = requests.get(TDCC_URL, headers=H, timeout=90)
+        r.encoding = "utf-8"
+        import csv as _csv
+        import io as _io
+        rd = _csv.reader(_io.StringIO(r.text))
+        header = next(rd, None)
+        if not header:
+            return out
+        idx = {h.strip(): i for i, h in enumerate(header)}
+        i_isin = idx.get("基金ISIN_CODE") or idx.get("ISINCODE")
+        i_agent = idx.get("基金總代理名稱") or idx.get("總代理機構")
+        i_inst = idx.get("境外基金機構")
+        if i_isin is None:
+            return out
+        for row in rd:
+            if len(row) <= max(i for i in [i_isin, i_agent, i_inst] if i is not None):
+                continue
+            iz = row[i_isin].strip().upper()
+            if not iz:
+                continue
+            agent = _resolve_agent(row[i_agent].strip()) if i_agent is not None else ""
+            series = _clean_series(row[i_inst].strip()) if i_inst is not None else ""
+            out[iz] = (agent, series)
+        print("  TDCC 對照：{} 檔 ISIN→總代理/機構".format(len(out)))
+    except Exception as e:
+        print("  TDCC 抓取失敗(用名稱備援)：{}".format(str(e)[:60]))
+    return out
+
+
 def enumerate_universe():
+    tdcc = fetch_tdcc_isin_map()      # 官方 ISIN→(發行,系列)，鐵律32
     funds, page, last = [], 1, 1
     while page <= last:
         try:
@@ -73,6 +179,8 @@ def enumerate_universe():
                 code = (d.get("cnyesId") or "").replace(",", "")
                 if not code:
                     continue
+                _isin = (d.get("isin") or "").strip().upper()
+                _agent, _series = tdcc.get(_isin, ("", ""))
                 funds.append({
                     "代碼": code, "0P": d.get("fundClassId") or "",
                     "isin": d.get("isin") or "",
@@ -80,6 +188,7 @@ def enumerate_universe():
                     "幣別": d.get("classCurrencyLocal") or "",
                     "投資區域": d.get("investmentArea") or "未分類",
                     "資產類型": classify_asset(d.get("displayNameLocal"), d.get("categoryAbbr")),
+                    "發行": _agent, "系列": _series,
                 })
         except Exception as e:
             print("  第{}頁失敗：{}".format(page, e))
@@ -144,7 +253,8 @@ def fetch_segment():
                     w.writerow({"代碼": fund["代碼"], "日期": iso, "淨值": nav,
                                 "幣別": fund["幣別"], "名稱": fund["名稱"],
                                 "來源": "yfinance", "資產類型": fund["資產類型"],
-                                "投資區域": fund["投資區域"]})
+                                "投資區域": fund["投資區域"],
+                                "發行": fund.get("發行", ""), "系列": fund.get("系列", "")})
                 total_rows += len(rows)
             if (n + 1) % 50 == 0:
                 print("  進度 {}/{}：命中 {} 檔、{:,} 筆".format(n + 1, len(mine), ok, total_rows))
