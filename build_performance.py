@@ -28,28 +28,22 @@ def get_big5(url):
     return r.text
 
 
-def discover_categories(landing_url, page_key):
-    """多策略探索類別：<option value>、href 參數 A/B。並印偵錯供人工確認。"""
-    try:
-        html = get_big5(landing_url)
-    except Exception as e:
-        print("  類別探索失敗 {}: {}".format(page_key, e))
-        return set()
-    cats = set()
-    # 策略1：href 帶 A=..&B=..
-    for A, B in re.findall(r"[?&]A=([A-Za-z0-9]+)&B=([0-9]+)", html):
-        cats.add((A, B))
-    # 策略2：<option value="ET001001"> 型（類別碼常是字母+數字）
-    opts = re.findall(r'<option[^>]*value="([A-Za-z]{2}[A-Za-z0-9]{3,})"', html)
-    for v in opts:
-        cats.add((v, ""))
-    # 策略3：<option value="806"> 純數字（可能是B/子類）
-    # 偵錯：印出前幾個 select 區塊，讓我們看真實結構
-    sels = re.findall(r"<select[^>]*name=\"?([^\">]+)\"?[^>]*>", html)
-    print("  [{}] select 名稱: {}".format(page_key, sels[:8]))
-    print("  [{}] option 樣本: {}".format(page_key, opts[:12]))
-    print("  [{}] href A/B 樣本: {}".format(page_key, list(cats)[:12]))
+def domestic_cats():
+    """境內類別碼枚舉：ET{major:03d}{sub:03d}，涵蓋股票/債券/平衡/貨幣/組合/指數等。"""
+    cats = []
+    for major in range(0, 8):        # 主類 0~7
+        for sub in range(1, 41):     # 子類 1~40
+            cats.append(("ET{:03d}{:03d}".format(major, sub), "806"))
     return cats
+
+
+def offshore_cats():
+    """境外類別碼枚舉：A=1~25, B=1~12（數字制）。"""
+    return [(str(a), str(b)) for a in range(1, 26) for b in range(1, 13)]
+
+
+def discover_categories(landing_url, page_key):
+    return set()   # 保留介面；實際改用 domestic_cats/offshore_cats 枚舉
 
 
 def _num(x):
@@ -125,27 +119,38 @@ def parse_perf_table(html):
 
 def main():
     all_rows = []
-    for page_url, page_key, region in [(DOMESTIC, "yp401000", "境內"),
-                                        (OFFSHORE, "yp401001", "境外")]:
-        cats = discover_categories(page_url, page_key)
-        print("{}：發現 {} 個類別".format(region, len(cats)))
-        for i, (A, B) in enumerate(sorted(cats)):
+    seen = set()
+    plan = [(DOMESTIC, "境內", domestic_cats()),
+            (OFFSHORE, "境外", offshore_cats())]
+    for page_url, region, cats in plan:
+        hit = 0
+        for i, (A, B) in enumerate(cats):
             url = "{}?A={}&B={}".format(page_url, A, B)
             try:
                 html = get_big5(url)
                 rows = parse_perf_table(html)
+                new_in_cat = 0
                 for d in rows:
-                    d["_類別代碼"] = "{}/{}".format(A, B)
+                    key = (region, d["名稱"])
+                    if key in seen:
+                        continue
+                    seen.add(key)
                     d["_境內外"] = region
+                    d["_類別代碼"] = "{}/{}".format(A, B)
                     all_rows.append(d)
-            except Exception as e:
-                print("  類別 {} 失敗: {}".format(A, str(e)[:50]))
-            time.sleep(0.4)
-            if (i + 1) % 20 == 0:
-                print("  {} 已抓 {}/{} 類".format(region, i + 1, len(cats)))
+                    new_in_cat += 1
+                if new_in_cat:
+                    hit += 1
+            except Exception:
+                pass
+            time.sleep(0.25)
+            if (i + 1) % 50 == 0:
+                print("  {} 掃描 {}/{} 類，已收 {} 檔".format(
+                    region, i + 1, len(cats), len(all_rows)))
+        print("{}：有資料類別 {} 個，累計 {} 檔".format(region, hit, len(all_rows)))
 
     if not all_rows:
-        print("❌ 沒抓到任何績效資料，可能頁面結構改版，需檢查")
+        print("❌ 沒抓到任何績效資料，需檢查頁面結構")
         sys.exit(1)
 
     import os
@@ -156,12 +161,14 @@ def main():
     for d in all_rows:
         d["_正規名"] = norm_name(d.get("名稱", ""))
     with open(OUT, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=keys)
+        w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
         w.writeheader()
         for d in all_rows:
             w.writerow(d)
-    print("✅ 寫入 {}：{} 檔績效、{} 欄".format(OUT, len(all_rows), len(keys)))
-    print("欄位：", keys)
+    print("✅ 寫入 {}：{} 檔績效".format(OUT, len(all_rows)))
+    dom = sum(1 for d in all_rows if d["_境內外"] == "境內")
+    off = sum(1 for d in all_rows if d["_境內外"] == "境外")
+    print("   境內 {} 檔 / 境外 {} 檔".format(dom, off))
 
 
 if __name__ == "__main__":
