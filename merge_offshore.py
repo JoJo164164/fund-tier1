@@ -9,7 +9,7 @@ import os
 import sys
 from collections import defaultdict
 
-COLS = ["代碼", "日期", "淨值", "幣別", "名稱", "來源", "資產類型", "投資區域"]
+COLS = ["代碼", "日期", "淨值", "幣別", "名稱", "來源", "資產類型", "投資區域", "發行", "系列"]
 MAX_BYTES = 80 * 1024 * 1024   # 每檔上限 80MB
 
 
