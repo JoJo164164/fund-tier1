@@ -29,16 +29,26 @@ def get_big5(url):
 
 
 def discover_categories(landing_url, page_key):
-    """從排名頁抽出所有類別參數 (A,B)。"""
+    """多策略探索類別：<option value>、href 參數 A/B。並印偵錯供人工確認。"""
     try:
         html = get_big5(landing_url)
     except Exception as e:
         print("  類別探索失敗 {}: {}".format(page_key, e))
         return set()
-    pat = re.escape(page_key) + r"\.djhtm\?A=([A-Za-z0-9]+)&B=([0-9]+)"
-    cats = set(re.findall(pat, html))
-    # 也抓大小寫變體
-    cats |= set(re.findall(page_key.upper() + r"\.DJHTM\?A=([A-Za-z0-9]+)&B=([0-9]+)", html))
+    cats = set()
+    # 策略1：href 帶 A=..&B=..
+    for A, B in re.findall(r"[?&]A=([A-Za-z0-9]+)&B=([0-9]+)", html):
+        cats.add((A, B))
+    # 策略2：<option value="ET001001"> 型（類別碼常是字母+數字）
+    opts = re.findall(r'<option[^>]*value="([A-Za-z]{2}[A-Za-z0-9]{3,})"', html)
+    for v in opts:
+        cats.add((v, ""))
+    # 策略3：<option value="806"> 純數字（可能是B/子類）
+    # 偵錯：印出前幾個 select 區塊，讓我們看真實結構
+    sels = re.findall(r"<select[^>]*name=\"?([^\">]+)\"?[^>]*>", html)
+    print("  [{}] select 名稱: {}".format(page_key, sels[:8]))
+    print("  [{}] option 樣本: {}".format(page_key, opts[:12]))
+    print("  [{}] href A/B 樣本: {}".format(page_key, list(cats)[:12]))
     return cats
 
 
@@ -61,33 +71,55 @@ def norm_name(name):
     return s.strip()
 
 
+def _pick(d, *keys):
+    """從 row dict 找第一個 key 名稱含指定關鍵字的值。"""
+    for k, v in d.items():
+        ks = str(k)
+        if all(kw in ks for kw in keys):
+            return v
+    return None
+
+
 def parse_perf_table(html):
-    """從頁面抓績效表 → list of dict。欄位自動偵測(報酬/風險)。"""
+    """抓績效表 → 統一乾淨欄位 list。境內單層/境外雙層表頭都轉成同一組。"""
     try:
         tables = pd.read_html(io.StringIO(html))
     except Exception:
         return []
     tbl = None
     for t in tables:
-        header = "".join(str(c) for c in t.columns) + "".join(str(c) for c in t.iloc[0].tolist()) if len(t) else ""
-        if "排名" in header or "一個月" in header or "基金名稱" in header:
+        flat = "".join(str(c) for c in t.columns)
+        if ("基金名稱" in flat or "名稱" in flat) and ("一個月" in flat or "報酬" in flat or "排名" in flat):
             tbl = t
             break
     if tbl is None:
         return []
-    # 攤平欄名
-    tbl.columns = [re.sub(r"\s+", "", str(c)) for c in tbl.columns]
+    tbl.columns = ["|".join(str(x) for x in c) if isinstance(c, tuple) else str(c)
+                   for c in tbl.columns]
     rows = []
     for _, r in tbl.iterrows():
-        d = {re.sub(r"\s+", "", str(k)): v for k, v in r.items()}
-        name = None
-        for k in d:
-            if "基金名稱" in k or "名稱" in k:
-                name = str(d[k])
-                break
+        d = {str(k): v for k, v in r.items()}
+        name = _pick(d, "基金名稱") or _pick(d, "名稱")
+        name = str(name).strip() if name is not None else ""
         if not name or name in ("nan", "基金名稱"):
             continue
-        rows.append(d)
+        rows.append({
+            "名稱": name,
+            "公司": str(_pick(d, "基金公司") or _pick(d, "公司") or "").strip(),
+            "排名": _num(_pick(d, "排名")),
+            "一個月%": _num(_pick(d, "一個月")),
+            "三個月%": _num(_pick(d, "三個月")),
+            "六個月%": _num(_pick(d, "六個月")),
+            "一年%": _num(_pick(d, "一年")),
+            "三年%": _num(_pick(d, "三年")),
+            "五年%": _num(_pick(d, "五年")),
+            "十年%": _num(_pick(d, "十年")),
+            "年化標準差": _num(_pick(d, "標準差")),
+            "Sharpe": _num(_pick(d, "Sharpe")),
+            "Beta": _num(_pick(d, "Beta")),
+            "投資區域": str(_pick(d, "投資區域") or "").strip(),
+            "淨值日期": str(_pick(d, "日期") or "").strip(),
+        })
     return rows
 
 
@@ -116,13 +148,13 @@ def main():
         print("❌ 沒抓到任何績效資料，可能頁面結構改版，需檢查")
         sys.exit(1)
 
-    # 統一欄位輸出
     import os
     os.makedirs("data", exist_ok=True)
-    keys = set()
+    keys = ["名稱", "公司", "_境內外", "_類別代碼", "投資區域", "排名",
+            "一個月%", "三個月%", "六個月%", "一年%", "三年%", "五年%", "十年%",
+            "年化標準差", "Sharpe", "Beta", "淨值日期", "_正規名"]
     for d in all_rows:
-        keys |= set(d.keys())
-    keys = sorted(keys)
+        d["_正規名"] = norm_name(d.get("名稱", ""))
     with open(OUT, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.DictWriter(f, fieldnames=keys)
         w.writeheader()
