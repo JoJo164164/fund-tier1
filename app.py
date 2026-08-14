@@ -532,9 +532,26 @@ def _norm_name(s):
     return s.strip()
 
 
+import re as _re2
+_CLASS_TOK = _re2.compile(
+    r"(累積型?|配息型?|累計|月配息?|季配息?|年配息?|穩定月?收益?|避險|不?配息|類股|類|"
+    r"[A-Z]{1,3}\d?類?股?|美元|歐元|台幣|日圓|人民幣|南非幣|澳幣|英鎊|加幣|紐幣|新台幣)$")
+
+
+def _norm_loose(s):
+    """更寬鬆：去類股後綴(累積/配息/避險/幣別/A類…)，提升同基金不同類股的命中。"""
+    s = _norm_name(s)
+    prev = None
+    while prev != s:                 # 反覆剝除尾端類股token
+        prev = s
+        s = _CLASS_TOK.sub("", s)
+        s = s.rstrip("之基金")
+    return s
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_performance():
-    """讀 MoneyDJ 官方績效 → (DataFrame, {正規名: dict})。無檔則回空。"""
+    """讀 MoneyDJ 官方績效 → (DataFrame, {key: dict})；key 含正規名+寬鬆名。"""
     import os
     if not os.path.exists("data/performance.csv"):
         return pd.DataFrame(), {}
@@ -547,11 +564,18 @@ def load_performance():
     for c in numc:
         if c in p.columns:
             p[c] = pd.to_numeric(p[c], errors="coerce")
-    key = "_正規名" if "_正規名" in p.columns else "名稱"
     lut = {}
     for _, r in p.iterrows():
-        lut[str(r[key])] = r.to_dict()
+        d = r.to_dict()
+        nm = str(d.get("名稱", ""))
+        lut.setdefault(_norm_name(nm), d)
+        lut.setdefault(_norm_loose(nm), d)      # 寬鬆鍵當備援(不覆蓋精確)
     return p, lut
+
+
+def _perf_lookup(name, lut):
+    """先精確、再寬鬆比對官方績效。"""
+    return lut.get(_norm_name(name)) or lut.get(_norm_loose(name))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1647,22 +1671,34 @@ def main():
                         thr = float(thr_a)
                         HZ = mp.HORIZONS
 
-                        # 🏅 官方績效卡（MoneyDJ，用名稱 join）
+                        # 🏅 官方績效（MoneyDJ）— 一定顯示區塊，做成漂亮表
                         _pname = pick_lab.split("  (")[0]
                         _, _plut = load_performance()
-                        _pf = _plut.get(_norm_name(_pname))
+                        _pf = _perf_lookup(_pname, _plut)
+                        _icon_title("cmp", "官方績效（MoneyDJ）")
                         if _pf:
-                            _icon_title("cmp", "官方績效（MoneyDJ）")
-                            pc = st.columns(4)
-                            pc[0].metric("一年報酬", "{}%".format(_pf.get("一年%")) if pd.notna(_pf.get("一年%")) else "—")
-                            pc[1].metric("三年報酬", "{}%".format(_pf.get("三年%")) if pd.notna(_pf.get("三年%")) else "—")
-                            pc[2].metric("Sharpe", _pf.get("Sharpe") if pd.notna(_pf.get("Sharpe")) else "—")
-                            pc[3].metric("同類排名", "第 {} 名".format(int(_pf["排名"])) if pd.notna(_pf.get("排名")) else "—")
-                            _pr = {k: _pf.get(k) for k in ["一個月%", "三個月%", "六個月%", "一年%", "三年%", "五年%", "十年%"] if pd.notna(_pf.get(k))}
-                            if _pr:
-                                st.caption("官方各期報酬：" + "｜".join("{} {}%".format(k.replace("%", ""), v) for k, v in _pr.items())
-                                           + "（來源 MoneyDJ，考慮配息）")
-                            st.markdown("---")
+                            _prow = {
+                                "一個月": _pf.get("一個月%"), "三個月": _pf.get("三個月%"),
+                                "六個月": _pf.get("六個月%"), "一年": _pf.get("一年%"),
+                                "三年": _pf.get("三年%"), "五年": _pf.get("五年%"),
+                                "十年": _pf.get("十年%"),
+                            }
+                            _pdf = pd.DataFrame([_prow])
+                            _rcols = list(_pdf.columns)
+                            st.dataframe(
+                                _pdf.style.background_gradient(cmap="RdYlGn", vmin=-30, vmax=30,
+                                                               subset=_rcols)
+                                .format("{:.2f}%", subset=_rcols, na_rep="—"),
+                                use_container_width=True, hide_index=True)
+                            rk = st.columns(4)
+                            rk[0].metric("年化標準差", "{}%".format(_pf["年化標準差"]) if pd.notna(_pf.get("年化標準差")) else "—")
+                            rk[1].metric("Sharpe", _pf.get("Sharpe") if pd.notna(_pf.get("Sharpe")) else "—")
+                            rk[2].metric("Beta", _pf.get("Beta") if pd.notna(_pf.get("Beta")) else "—")
+                            rk[3].metric("同類排名", "第 {} 名".format(int(_pf["排名"])) if pd.notna(_pf.get("排名")) else "—")
+                            st.caption("來源 MoneyDJ，考慮配息、原幣別。境內風險指標暫缺(依類型頁未提供)。")
+                        else:
+                            st.info("此檔在 MoneyDJ 無對應官方績效（可能名稱/類股差異）。滾動跌幅與回測分析不受影響，見下方。")
+                        st.markdown("---")
 
                         win_df, avg_df, dd_df = mp.build_summary_tables(prices)
 
@@ -1865,7 +1901,7 @@ def main():
                         _row = _meta.loc[code] if code in _meta.index else None
                         nm = str(_row["名稱"]) if _row is not None and "名稱" in _meta.columns else ""
                         ser = str(_row["系列"]) if _row is not None and "系列" in _meta.columns else ""
-                        _pf = _cmp_plut.get(_norm_name(nm), {})
+                        _pf = _perf_lookup(nm, _cmp_plut) or {}
                         rows.append({
                             "代碼": code, "名稱": nm[:36], "系列": ser,
                             "滾動10日%": round(last["return"], 2),
@@ -1901,45 +1937,77 @@ def main():
     # ══ 績效 Ranking（MoneyDJ 官方報酬/風險/排名）══
     with tab_rank:
         _icon_title("cmp", "績效 Ranking（MoneyDJ 官方）")
-        st.caption("官方報酬(1M~10Y) + 風險(境外含標準差/Sharpe/Beta) + 官方排名。"
+        st.caption("官方報酬(1M~10Y) + 風險(境外含標準差/Sharpe/Beta) + 名次。"
                    "來源：MoneyDJ FundDJ，考慮配息、原幣別。")
         perf_df, _ = load_performance()
         if len(perf_df) == 0:
             st.info("尚無績效資料。請先在 GitHub Actions 跑「建置 基金績效Ranking」產生 data/performance.csv。")
         else:
-            r1, r2, r3 = st.columns(3)
-            reg = r1.selectbox("境內/境外", ["全部", "境內", "境外"], key="rk_reg")
-            v = perf_df
-            if reg != "全部" and "_境內外" in v.columns:
+            # 併我們的分類(發行/系列/資產類型) → filter 跟個別分析一致
+            _meta = load_fund_meta().copy()
+            _meta["_k"] = _meta["名稱"].map(_norm_name)
+            _mu = _meta.drop_duplicates("_k").set_index("_k")
+            pf = perf_df.copy()
+            pf["_k"] = pf["名稱"].map(_norm_name)
+            for col in ["發行", "系列", "資產類型"]:
+                pf[col] = pf["_k"].map(_mu[col]) if col in _mu.columns else ""
+
+            def _o(col, src):
+                if col not in src.columns:
+                    return ["全部"]
+                return ["全部"] + sorted([x for x in src[col].dropna().unique().tolist() if str(x).strip()])
+
+            f1, f2, f3 = st.columns(3)
+            f4, f5, f6 = st.columns(3)
+            v = pf
+            reg = f1.selectbox("境內/境外", _o("_境內外", v), key="rk_reg")
+            if reg != "全部":
                 v = v[v["_境內外"] == reg]
-            comp_opts = ["全部"] + sorted([x for x in v["公司"].dropna().unique().tolist() if str(x).strip()]) if "公司" in v.columns else ["全部"]
-            comp = r2.selectbox("基金公司", comp_opts, key="rk_comp")
-            if comp != "全部":
-                v = v[v["公司"] == comp]
-            period = r3.selectbox("排序期間", ["一年%", "六個月%", "三個月%", "一個月%",
-                                             "三年%", "五年%", "十年%", "Sharpe"], key="rk_period")
-            area_opts = ["全部"] + sorted([x for x in v["投資區域"].dropna().unique().tolist() if str(x).strip()]) if "投資區域" in v.columns else ["全部"]
-            area = st.selectbox("投資區域", area_opts, key="rk_area")
+            iss = f2.selectbox("發行公司", _o("發行", v), key="rk_iss")
+            if iss != "全部":
+                v = v[v["發行"] == iss]
+            ser = f3.selectbox("系列（總代理旗下品牌）", _o("系列", v), key="rk_ser")
+            if ser != "全部":
+                v = v[v["系列"] == ser]
+            ast = f4.selectbox("資產類型", _o("資產類型", v), key="rk_ast")
+            if ast != "全部":
+                v = v[v["資產類型"] == ast]
+            area = f5.selectbox("投資區域", _o("投資區域", v), key="rk_area")
             if area != "全部":
                 v = v[v["投資區域"] == area]
+            period = f6.selectbox("排序期間", ["一年%", "六個月%", "三個月%", "一個月%",
+                                             "三年%", "五年%", "十年%", "Sharpe"], key="rk_period")
 
-            show_cols = [c for c in ["名稱", "公司", "_境內外", "投資區域",
+            show_cols = [c for c in ["名稱", "發行", "系列", "_境內外", "投資區域",
                                      "一個月%", "三個月%", "六個月%", "一年%", "三年%",
-                                     "五年%", "十年%", "年化標準差", "Sharpe", "Beta",
-                                     "淨值日期"] if c in v.columns]
+                                     "五年%", "十年%", "年化標準差", "Sharpe", "Beta"]
+                         if c in v.columns]
             vv = v[show_cols].copy()
             if period in vv.columns:
                 vv = vv.sort_values(period, ascending=False, na_position="last")
             vv = vv.reset_index(drop=True)
             vv.insert(0, "名次", range(1, len(vv) + 1))
-            st.success("**{} 檔**（依 {} 由高到低）。點欄位標題可改排序。".format(len(vv), period))
-            colcfg = {c: st.column_config.NumberColumn(c, format="%.2f")
-                      for c in vv.columns if c.endswith("%") or c in ("Sharpe", "Beta", "年化標準差")}
-            st.dataframe(vv, use_container_width=True, height=600, hide_index=True,
-                         column_config=colcfg)
+            vv = vv.rename(columns={"_境內外": "境內外", "發行": "發行公司"})
+            st.success("**{} 檔**（依 {} 由高到低）。紅→綠＝報酬低→高；點欄位標題可改排序。".format(len(vv), period))
+
+            _ret = [c for c in ["一個月%", "三個月%", "六個月%", "一年%", "三年%",
+                                "五年%", "十年%"] if c in vv.columns]
+            _sty = vv.style
+            if _ret:
+                _sty = _sty.background_gradient(cmap="RdYlGn", vmin=-30, vmax=30, subset=_ret)
+            if "Sharpe" in vv.columns:
+                _sty = _sty.background_gradient(cmap="Greens", vmin=0, vmax=2, subset=["Sharpe"])
+            _fmt = {c: "{:.2f}%" for c in _ret}
+            for c in ["年化標準差", "Sharpe", "Beta"]:
+                if c in vv.columns:
+                    _fmt[c] = "{:.2f}"
+            _sty = _sty.format(_fmt, na_rep="—").set_properties(
+                subset=["名稱"], **{"text-align": "left"})
+            st.dataframe(_sty, use_container_width=True, height=620, hide_index=True)
             st.download_button("⬇️ 下載 CSV", vv.to_csv(index=False).encode("utf-8-sig"),
                                file_name="ranking_{}.csv".format(dt.date.today()), mime="text/csv")
-            st.caption("境內依類型頁僅提供報酬(無風險指標)；境外含完整風險。列印 Ctrl+P。")
+            st.caption("發行公司/系列以基金名對應我們的官方分類；對不到者該欄空白。"
+                       "境內依類型頁僅報酬(無風險)，境外含完整風險。列印 Ctrl+P。")
 
     # ══ 筆記（手動、可下載保存；取代自動追蹤日誌）══
     with tab_notes:
