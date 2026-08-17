@@ -34,6 +34,48 @@ try:
 except Exception:
     _HAS_MP = False
 
+
+def _heat_rg(vmin, vmax):
+    """紅→白→綠 發散上色（不需 matplotlib）；負紅正綠，Allianz 慣例。"""
+    def _f(s):
+        res = []
+        for v in s:
+            try:
+                x = float(v)
+            except Exception:
+                res.append("")
+                continue
+            t = (x - vmin) / (vmax - vmin) if vmax > vmin else 0.5
+            t = max(0.0, min(1.0, t))
+            if t < 0.5:                      # 紅(246,36,89)→白
+                u = t * 2
+                r, g, b = 246, int(36 + (255 - 36) * u), int(89 + (255 - 89) * u)
+                r = int(246 + (255 - 246) * u)
+            else:                            # 白→綠(0,144,141)
+                u = (t - 0.5) * 2
+                r, g, b = int(255 - 255 * u), int(255 - (255 - 144) * u), int(255 - (255 - 141) * u)
+            res.append("background-color: rgb({},{},{})".format(r, g, b))
+        return res
+    return _f
+
+
+def _heat_g(vmin, vmax):
+    """白→綠 單向上色（Sharpe 用）。"""
+    def _f(s):
+        res = []
+        for v in s:
+            try:
+                x = float(v)
+            except Exception:
+                res.append("")
+                continue
+            t = (x - vmin) / (vmax - vmin) if vmax > vmin else 0.5
+            t = max(0.0, min(1.0, t))
+            r, g, b = int(255 - 255 * t), int(255 - (255 - 144) * t), int(255 - (255 - 141) * t)
+            res.append("background-color: rgb({},{},{})".format(r, g, b))
+        return res
+    return _f
+
 _ICONS = {
     "sys": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 96 96\" width=\"38\" height=\"38\">  <circle cx=\"48\" cy=\"48\" r=\"45\" fill=\"none\" stroke=\"#003781\" stroke-width=\"2\"/>  <g fill=\"none\" stroke=\"#003781\" stroke-width=\"2.4\" stroke-linecap=\"round\" stroke-linejoin=\"round\">    <path d=\"M48 22 L68 29 V47 C68 61 59 70 48 75 C37 70 28 61 28 47 V29 Z\"/>    <path d=\"M40 48 L46 55 L58 41\"/  </g></svg>",
     "scan": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 96 96\" width=\"38\" height=\"38\">  <circle cx=\"48\" cy=\"48\" r=\"45\" fill=\"none\" stroke=\"#003781\" stroke-width=\"2\"/>  <g fill=\"none\" stroke=\"#003781\" stroke-width=\"2.4\" stroke-linecap=\"round\" stroke-linejoin=\"round\">    <circle cx=\"43\" cy=\"43\" r=\"14\"/>    <path d=\"M53 53 L66 66\"/>    <path d=\"M37 43 H49 M43 37 V49\" stroke-width=\"1.8\"/  </g></svg>",
@@ -1766,8 +1808,7 @@ def main():
                             _pdf = pd.DataFrame([_prow])
                             _rcols = list(_pdf.columns)
                             st.dataframe(
-                                _pdf.style.background_gradient(cmap="RdYlGn", vmin=-30, vmax=30,
-                                                               subset=_rcols)
+                                _pdf.style.apply(_heat_rg(-30, 30), subset=_rcols)
                                 .format("{:.2f}%", subset=_rcols, na_rep="—"),
                                 use_container_width=True, hide_index=True)
                             rk = st.columns(4)
@@ -2074,9 +2115,9 @@ def main():
                                 "五年%", "十年%"] if c in vv.columns]
             _sty = vv.style
             if _ret:
-                _sty = _sty.background_gradient(cmap="RdYlGn", vmin=-30, vmax=30, subset=_ret)
+                _sty = _sty.apply(_heat_rg(-30, 30), subset=_ret)
             if "Sharpe" in vv.columns:
-                _sty = _sty.background_gradient(cmap="Greens", vmin=0, vmax=2, subset=["Sharpe"])
+                _sty = _sty.apply(_heat_g(0, 2), subset=["Sharpe"])
             _fmt = {c: "{:.2f}%" for c in _ret}
             for c in ["年化標準差", "Sharpe", "Beta"]:
                 if c in vv.columns:
@@ -2112,7 +2153,7 @@ def main():
                 rdf = pd.DataFrame(rows)
                 st.markdown("**{}股市指數**".format(region))
                 st.dataframe(
-                    rdf.style.background_gradient(cmap="RdYlGn", vmin=-3, vmax=3, subset=["漲跌%"])
+                    rdf.style.apply(_heat_rg(-3, 3), subset=["漲跌%"])
                     .format({"現價": "{:,.2f}", "漲跌": "{:+,.2f}", "漲跌%": "{:+.2f}%"}, na_rep="—"),
                     use_container_width=True, hide_index=True,
                     height=min(560, 40 + len(rdf) * 35))
@@ -2139,7 +2180,7 @@ def main():
                     return
                 st.markdown("**{}**".format(title))
                 st.dataframe(
-                    out.style.background_gradient(cmap="RdYlGn", vmin=-3, vmax=3, subset=["漲跌幅%"])
+                    out.style.apply(_heat_rg(-3, 3), subset=["漲跌幅%"])
                     .format({"漲跌幅%": "{:+.2f}%"}, na_rep="—"),
                     use_container_width=True, hide_index=True,
                     height=min(420, 40 + len(out) * 35))
@@ -2159,8 +2200,8 @@ def main():
                 mo = mo[mo["今年%"].notna()].reset_index(drop=True)
                 st.markdown("**MSCI 指數**")
                 st.dataframe(
-                    mo.style.background_gradient(cmap="RdYlGn", vmin=-3, vmax=3, subset=["單日%"])
-                    .background_gradient(cmap="RdYlGn", vmin=-30, vmax=30, subset=["本月%", "今年%"])
+                    mo.style.apply(_heat_rg(-3, 3), subset=["單日%"])
+                    .apply(_heat_rg(-30, 30), subset=["本月%", "今年%"])
                     .format({c: "{:+.2f}%" for c in ["單日%", "本月%", "今年%"]}, na_rep="—"),
                     use_container_width=True, hide_index=True, height=420)
         st.caption("商品/MSCI/期貨來源 StockQ。列印 Ctrl+P。")
@@ -2196,16 +2237,14 @@ def main():
                     with cc[0]:
                         st.markdown("**📈 表現最好（{}）**".format(sel))
                         b = movers[idx]
-                        st.dataframe(b.style.background_gradient(cmap="RdYlGn", vmin=-5, vmax=5,
-                                                                 subset=["漲跌幅%"])
+                        st.dataframe(b.style.apply(_heat_rg(-5, 5), subset=["漲跌幅%"])
                                      .format({"漲跌幅%": "{:+.2f}%"}),
                                      use_container_width=True, hide_index=True, height=460)
                 if half + idx < len(movers):
                     with cc[1]:
                         st.markdown("**📉 表現最差（{}）**".format(sel))
                         w = movers[half + idx]
-                        st.dataframe(w.style.background_gradient(cmap="RdYlGn", vmin=-5, vmax=5,
-                                                                 subset=["漲跌幅%"])
+                        st.dataframe(w.style.apply(_heat_rg(-5, 5), subset=["漲跌幅%"])
                                      .format({"漲跌幅%": "{:+.2f}%"}),
                                      use_container_width=True, hide_index=True, height=460)
             st.caption("來源 StockQ /market/。列印 Ctrl+P。")
