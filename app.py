@@ -59,6 +59,28 @@ def _heat_rg(vmin, vmax):
     return _f
 
 
+def _heat_neg(vmin):
+    """只有負值上紅（vmin~0），正值留白。績效表用（不要綠）。"""
+    def _f(s):
+        res = []
+        for v in s:
+            try:
+                x = float(v)
+            except Exception:
+                res.append("")
+                continue
+            if x >= 0:
+                res.append("")
+                continue
+            t = max(0.0, min(1.0, x / vmin)) if vmin < 0 else 0.0   # 0..1(越負越深)
+            r = 246
+            g = int(255 - (255 - 36) * t)
+            b = int(255 - (255 - 89) * t)
+            res.append("background-color: rgb({},{},{})".format(r, g, b))
+        return res
+    return _f
+
+
 def _heat_g(vmin, vmax):
     """白→綠 單向上色（Sharpe 用）。"""
     def _f(s):
@@ -1808,15 +1830,20 @@ def main():
                             _pdf = pd.DataFrame([_prow])
                             _rcols = list(_pdf.columns)
                             st.dataframe(
-                                _pdf.style.apply(_heat_rg(-30, 30), subset=_rcols)
+                                _pdf.style.apply(_heat_neg(-30), subset=_rcols)
                                 .format("{:.2f}%", subset=_rcols, na_rep="—"),
                                 use_container_width=True, hide_index=True)
-                            rk = st.columns(4)
-                            rk[0].metric("年化標準差", "{}%".format(_pf["年化標準差"]) if pd.notna(_pf.get("年化標準差")) else "—")
-                            rk[1].metric("Sharpe", _pf.get("Sharpe") if pd.notna(_pf.get("Sharpe")) else "—")
-                            rk[2].metric("Beta", _pf.get("Beta") if pd.notna(_pf.get("Beta")) else "—")
-                            rk[3].metric("同類排名", "第 {} 名".format(int(_pf["排名"])) if pd.notna(_pf.get("排名")) else "—")
-                            st.caption("來源 MoneyDJ，考慮配息、原幣別。境內風險指標暫缺(依類型頁未提供)。")
+                            _has_risk = any(pd.notna(_pf.get(k)) for k in ["年化標準差", "Sharpe", "Beta"])
+                            if _has_risk:
+                                rk = st.columns(4)
+                                rk[0].metric("年化標準差", "{}%".format(_pf["年化標準差"]) if pd.notna(_pf.get("年化標準差")) else "—")
+                                rk[1].metric("Sharpe", _pf.get("Sharpe") if pd.notna(_pf.get("Sharpe")) else "—")
+                                rk[2].metric("Beta", _pf.get("Beta") if pd.notna(_pf.get("Beta")) else "—")
+                                rk[3].metric("同類排名", "第 {} 名".format(int(_pf["排名"])) if pd.notna(_pf.get("排名")) else "—")
+                            elif pd.notna(_pf.get("排名")):
+                                st.metric("同類排名", "第 {} 名".format(int(_pf["排名"])))
+                            st.caption("來源 MoneyDJ，考慮配息、原幣別。負報酬標紅。"
+                                       + ("" if _has_risk else "此檔為境內基金，來源未提供風險指標。"))
                         else:
                             st.info("此檔在 MoneyDJ 無對應官方績效（可能名稱/類股差異）。滾動跌幅與回測分析不受影響，見下方。")
                         st.markdown("---")
@@ -2097,38 +2124,38 @@ def main():
             if area != "全部":
                 v = v[v["投資區域"] == area]
             period = f6.selectbox("排序期間", ["一年%", "六個月%", "三個月%", "一個月%",
-                                             "三年%", "五年%", "十年%", "Sharpe"], key="rk_period")
+                                             "三年%", "五年%", "十年%"], key="rk_period")
 
-            show_cols = [c for c in ["名稱", "發行", "系列", "_境內外", "投資區域",
-                                     "一個月%", "三個月%", "六個月%", "一年%", "三年%",
-                                     "五年%", "十年%", "年化標準差", "Sharpe", "Beta"]
-                         if c in v.columns]
-            vv = v[show_cols].copy()
+            # 報酬為主(仿cnyes)；風險欄境內全無→不放進榜，保持乾淨
+            ret_cols = ["一個月%", "三個月%", "六個月%", "一年%", "三年%", "五年%", "十年%"]
+            base_cols = [c for c in ["名稱", "發行", "系列", "_境內外", "投資區域"] if c in v.columns]
+            vv = v[base_cols + [c for c in ret_cols if c in v.columns]].copy()
             if period in vv.columns:
                 vv = vv.sort_values(period, ascending=False, na_position="last")
             vv = vv.reset_index(drop=True)
-            vv.insert(0, "名次", range(1, len(vv) + 1))
             vv = vv.rename(columns={"_境內外": "境內外", "發行": "發行公司"})
-            st.success("**{} 檔**（依 {} 由高到低）。紅→綠＝報酬低→高；點欄位標題可改排序。".format(len(vv), period))
+            # 隱藏整欄皆空的欄位（如篩選後發行/系列/區域全無）
+            for c in list(vv.columns):
+                col = vv[c]
+                if col.isna().all() or (col.astype(str).str.strip() == "").all():
+                    vv = vv.drop(columns=[c])
+            # 名稱最前 + 名次
+            vv.insert(0, "名次", range(1, len(vv) + 1))
+            cols = ["名稱", "名次"] + [c for c in vv.columns if c not in ("名稱", "名次")]
+            vv = vv[cols]
+            st.success("**{} 檔**（依 {} 由高到低）。負報酬標紅；點欄位標題可改排序。".format(len(vv), period))
 
-            _ret = [c for c in ["一個月%", "三個月%", "六個月%", "一年%", "三年%",
-                                "五年%", "十年%"] if c in vv.columns]
+            _ret = [c for c in ret_cols if c in vv.columns]
             _sty = vv.style
             if _ret:
-                _sty = _sty.apply(_heat_rg(-30, 30), subset=_ret)
-            if "Sharpe" in vv.columns:
-                _sty = _sty.apply(_heat_g(0, 2), subset=["Sharpe"])
-            _fmt = {c: "{:.2f}%" for c in _ret}
-            for c in ["年化標準差", "Sharpe", "Beta"]:
-                if c in vv.columns:
-                    _fmt[c] = "{:.2f}"
-            _sty = _sty.format(_fmt, na_rep="—").set_properties(
+                _sty = _sty.apply(_heat_neg(-30), subset=_ret)      # 只負紅、不要綠
+            _sty = _sty.format({c: "{:.2f}%" for c in _ret}, na_rep="—").set_properties(
                 subset=["名稱"], **{"text-align": "left"})
             st.dataframe(_sty, use_container_width=True, height=620, hide_index=True)
             st.download_button("⬇️ 下載 CSV", vv.to_csv(index=False).encode("utf-8-sig"),
                                file_name="ranking_{}.csv".format(dt.date.today()), mime="text/csv")
-            st.caption("發行公司/系列以基金名對應我們的官方分類；對不到者該欄空白。"
-                       "境內依類型頁僅報酬(無風險)，境外含完整風險。列印 Ctrl+P。")
+            st.caption("報酬為官方數字(MoneyDJ,考慮配息)。發行公司/系列以基金名對應官方分類，"
+                       "對不到者不顯示該欄。風險指標(標準差/Sharpe)因境內來源未提供，改於個別分析呈現。")
 
     # ══ 🌍 市場狀況（現貨指數 yfinance + 商品/MSCI/期貨 StockQ）══
     with tab_mkt:
@@ -2153,7 +2180,7 @@ def main():
                 rdf = pd.DataFrame(rows)
                 st.markdown("**{}股市指數**".format(region))
                 st.dataframe(
-                    rdf.style.apply(_heat_rg(-3, 3), subset=["漲跌%"])
+                    rdf.style.apply(_heat_neg(-3), subset=["漲跌%"])
                     .format({"現價": "{:,.2f}", "漲跌": "{:+,.2f}", "漲跌%": "{:+.2f}%"}, na_rep="—"),
                     use_container_width=True, hide_index=True,
                     height=min(560, 40 + len(rdf) * 35))
@@ -2180,16 +2207,20 @@ def main():
                     return
                 st.markdown("**{}**".format(title))
                 st.dataframe(
-                    out.style.apply(_heat_rg(-3, 3), subset=["漲跌幅%"])
+                    out.style.apply(_heat_neg(-3), subset=["漲跌幅%"])
                     .format({"漲跌幅%": "{:+.2f}%"}, na_rep="—"),
                     use_container_width=True, hide_index=True,
                     height=min(420, 40 + len(out) * 35))
 
-            com = _sq_find(_tabs, "黃金", "買價") or _sq_find(_tabs, "黃金")
+            com = _sq_find(_tabs, "黃金", "買價")
+            if com is None:
+                com = _sq_find(_tabs, "黃金")
             _render_sq(com, 0, 3, 1, "商品價格")
             fut = _sq_find(_tabs, "台指期")
             _render_sq(fut, 0, 3, 1, "全球指數期貨")
-            msci = _sq_find(_tabs, "世界指數") or _sq_find(_tabs, "AC世界指數")
+            msci = _sq_find(_tabs, "世界指數")
+            if msci is None:
+                msci = _sq_find(_tabs, "AC世界指數")
             if msci is not None:
                 m = msci.copy()
                 m.columns = [str(c) for c in range(len(m.columns))]
@@ -2200,8 +2231,8 @@ def main():
                 mo = mo[mo["今年%"].notna()].reset_index(drop=True)
                 st.markdown("**MSCI 指數**")
                 st.dataframe(
-                    mo.style.apply(_heat_rg(-3, 3), subset=["單日%"])
-                    .apply(_heat_rg(-30, 30), subset=["本月%", "今年%"])
+                    mo.style.apply(_heat_neg(-3), subset=["單日%"])
+                    .apply(_heat_neg(-30), subset=["本月%", "今年%"])
                     .format({c: "{:+.2f}%" for c in ["單日%", "本月%", "今年%"]}, na_rep="—"),
                     use_container_width=True, hide_index=True, height=420)
         st.caption("商品/MSCI/期貨來源 StockQ。列印 Ctrl+P。")
@@ -2237,14 +2268,14 @@ def main():
                     with cc[0]:
                         st.markdown("**📈 表現最好（{}）**".format(sel))
                         b = movers[idx]
-                        st.dataframe(b.style.apply(_heat_rg(-5, 5), subset=["漲跌幅%"])
+                        st.dataframe(b.style.apply(_heat_neg(-5), subset=["漲跌幅%"])
                                      .format({"漲跌幅%": "{:+.2f}%"}),
                                      use_container_width=True, hide_index=True, height=460)
                 if half + idx < len(movers):
                     with cc[1]:
                         st.markdown("**📉 表現最差（{}）**".format(sel))
                         w = movers[half + idx]
-                        st.dataframe(w.style.apply(_heat_rg(-5, 5), subset=["漲跌幅%"])
+                        st.dataframe(w.style.apply(_heat_neg(-5), subset=["漲跌幅%"])
                                      .format({"漲跌幅%": "{:+.2f}%"}),
                                      use_container_width=True, hide_index=True, height=460)
             st.caption("來源 StockQ /market/。列印 Ctrl+P。")
