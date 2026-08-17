@@ -578,6 +578,85 @@ def _perf_lookup(name, lut):
     return lut.get(_norm_name(name)) or lut.get(_norm_loose(name))
 
 
+# ── StockQ 全球市場（live 抓取，Allianz 色重畫；不 iframe）──
+_SQ_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537"}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _stockq_tables(url):
+    """抓 StockQ 頁 → list[DataFrame]。失敗回空清單。"""
+    import requests
+    try:
+        r = requests.get(url, headers=_SQ_HEADERS, timeout=20)
+        r.encoding = "utf-8"
+        return pd.read_html(io.StringIO(r.text))
+    except Exception:
+        return []
+
+
+def _sq_find(tables, *keywords):
+    """在多張表裡找第一張『內容含全部關鍵字』的表。"""
+    for t in tables:
+        blob = " ".join(str(x) for x in t.values.ravel()[:200])
+        if all(k in blob for k in keywords):
+            return t
+    return None
+
+
+def _sq_pct_to_num(s):
+    try:
+        return float(str(s).replace("%", "").replace(",", "").strip())
+    except Exception:
+        return None
+
+
+# ── 全球現貨指數（yfinance，我們技術棧已用）：亞洲/歐洲/美洲 ──
+_INDEX_MAP = {
+    "亞洲": [("台灣加權", "^TWII"), ("日經225", "^N225"), ("東證TOPIX", "^TPX"),
+             ("韓國KOSPI", "^KS11"), ("上海綜合", "000001.SS"), ("深證成指", "399001.SZ"),
+             ("滬深300", "000300.SS"), ("香港恆生", "^HSI"), ("恆生科技", "^HSTECH"),
+             ("新加坡", "^STI"), ("印度SENSEX", "^BSESN"), ("印尼", "^JKSE"),
+             ("馬來西亞", "^KLSE"), ("泰國SET", "^SET.BK"), ("澳洲200", "^AXJO")],
+    "歐洲": [("英國FTSE", "^FTSE"), ("德國DAX", "^GDAXI"), ("法國CAC", "^FCHI"),
+             ("歐洲Stoxx50", "^STOXX50E"), ("西班牙IBEX", "^IBEX"),
+             ("義大利FTSEMIB", "FTSEMIB.MI"), ("荷蘭AEX", "^AEX"), ("瑞士SMI", "^SSMI")],
+    "美洲": [("道瓊工業", "^DJI"), ("S&P 500", "^GSPC"), ("NASDAQ", "^IXIC"),
+             ("NASDAQ100", "^NDX"), ("費城半導體", "^SOX"), ("羅素2000", "^RUT"),
+             ("加拿大", "^GSPTSE"), ("巴西", "^BVSP"), ("墨西哥", "^MXX")],
+}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_spot_indices():
+    """yfinance 抓全球現貨指數現價+漲跌%。回 {name:(price,chg,pct)}。"""
+    try:
+        import yfinance as yf
+    except Exception:
+        return {}
+    tickers = [t for g in _INDEX_MAP.values() for _, t in g]
+    out = {}
+    try:
+        data = yf.download(tickers, period="5d", interval="1d",
+                           group_by="ticker", progress=False, threads=True)
+    except Exception:
+        return {}
+    name_by_t = {t: n for g in _INDEX_MAP.values() for n, t in g}
+    for t in tickers:
+        try:
+            col = data[t]["Close"].dropna()
+            if len(col) < 2:
+                continue
+            price = float(col.iloc[-1])
+            prev = float(col.iloc[-2])
+            chg = price - prev
+            pct = chg / prev * 100 if prev else None
+            out[name_by_t[t]] = (price, chg, pct)
+        except Exception:
+            continue
+    return out
+
+
 # ══════════════════════════════════════════════════════════════
 # 即時補最新（PENDING#1，Greg 選 A：app 掃描前即時抓，境內拿今天）
 #   目的：靜態庫最新日 = 上次建庫時間；掃描前即時抓「庫最新日之後~今天」的
@@ -1298,9 +1377,10 @@ def main():
 
     threshold = -10.0  # 各 tab 內可各自調整
 
-    tab_sys, tab_scan, tab_fund, tab_cmp, tab_rank, tab_notes = st.tabs(
+    (tab_sys, tab_scan, tab_fund, tab_cmp, tab_rank,
+     tab_mkt, tab_movers, tab_notes) = st.tabs(
         ["🛡️ 系統檢核", "☀️ 每早掃描", "🔍 個別基金分析", "🆚 同類型比較",
-         "🏆 績效Ranking", "📝 筆記"])
+         "🏆 績效Ranking", "🌍 市場狀況", "📊 漲跌排行", "📝 筆記"])
 
     # ══ 系統檢核（資料源綠勾表 + 排程 + 邏輯檢核 + SITCA測試）══
     with tab_sys:
@@ -2008,6 +2088,127 @@ def main():
                                file_name="ranking_{}.csv".format(dt.date.today()), mime="text/csv")
             st.caption("發行公司/系列以基金名對應我們的官方分類；對不到者該欄空白。"
                        "境內依類型頁僅報酬(無風險)，境外含完整風險。列印 Ctrl+P。")
+
+    # ══ 🌍 市場狀況（現貨指數 yfinance + 商品/MSCI/期貨 StockQ）══
+    with tab_mkt:
+        _icon_title("cmp", "市場狀況（全球現貨指數）")
+        st.caption("全球現貨指數(亞洲/歐洲/美洲) + 商品 + MSCI + 指數期貨。綠漲紅跌(我們慣例)。"
+                   "現貨指數 live 抓 yfinance；商品/MSCI/期貨抓 StockQ。約5分快取。")
+
+        # ── 現貨指數（yfinance）──
+        spot = load_spot_indices()
+        if not spot:
+            st.warning("現貨指數暫時抓取失敗（yfinance 連線或未安裝）。確認 requirements.txt 含 yfinance。")
+        else:
+            for region, lst in _INDEX_MAP.items():
+                rows = []
+                for nm, _t in lst:
+                    if nm in spot:
+                        p, c, pct = spot[nm]
+                        rows.append({"指數": nm, "現價": round(p, 2),
+                                     "漲跌": round(c, 2), "漲跌%": pct})
+                if not rows:
+                    continue
+                rdf = pd.DataFrame(rows)
+                st.markdown("**{}股市指數**".format(region))
+                st.dataframe(
+                    rdf.style.background_gradient(cmap="RdYlGn", vmin=-3, vmax=3, subset=["漲跌%"])
+                    .format({"現價": "{:,.2f}", "漲跌": "{:+,.2f}", "漲跌%": "{:+.2f}%"}, na_rep="—"),
+                    use_container_width=True, hide_index=True,
+                    height=min(560, 40 + len(rdf) * 35))
+            st.caption("現貨指數來源 yfinance（Yahoo），漲跌%＝對前一交易日收盤。")
+
+        st.markdown("---")
+        # ── 商品 / MSCI / 期貨（StockQ）──
+        _tabs = _stockq_tables("https://www.stockq.org/")
+        if not _tabs:
+            st.info("StockQ 商品/MSCI/期貨暫時無法連線。")
+        else:
+            def _render_sq(df, name_i, pct_i, price_i=None, title=""):
+                if df is None or len(df) == 0:
+                    return
+                df = df.copy()
+                df.columns = [str(c) for c in range(len(df.columns))]
+                out = pd.DataFrame()
+                out["名稱"] = df[str(name_i)].astype(str)
+                if price_i is not None and str(price_i) in df.columns:
+                    out["價格/指數"] = df[str(price_i)].astype(str)
+                out["漲跌幅%"] = df[str(pct_i)].map(_sq_pct_to_num)
+                out = out[out["漲跌幅%"].notna()].reset_index(drop=True)
+                if len(out) == 0:
+                    return
+                st.markdown("**{}**".format(title))
+                st.dataframe(
+                    out.style.background_gradient(cmap="RdYlGn", vmin=-3, vmax=3, subset=["漲跌幅%"])
+                    .format({"漲跌幅%": "{:+.2f}%"}, na_rep="—"),
+                    use_container_width=True, hide_index=True,
+                    height=min(420, 40 + len(out) * 35))
+
+            com = _sq_find(_tabs, "黃金", "買價") or _sq_find(_tabs, "黃金")
+            _render_sq(com, 0, 3, 1, "商品價格")
+            fut = _sq_find(_tabs, "台指期")
+            _render_sq(fut, 0, 3, 1, "全球指數期貨")
+            msci = _sq_find(_tabs, "世界指數") or _sq_find(_tabs, "AC世界指數")
+            if msci is not None:
+                m = msci.copy()
+                m.columns = [str(c) for c in range(len(m.columns))]
+                mo = pd.DataFrame({"MSCI": m["0"].astype(str),
+                                   "單日%": m["2"].map(_sq_pct_to_num),
+                                   "本月%": m["3"].map(_sq_pct_to_num),
+                                   "今年%": m["4"].map(_sq_pct_to_num)})
+                mo = mo[mo["今年%"].notna()].reset_index(drop=True)
+                st.markdown("**MSCI 指數**")
+                st.dataframe(
+                    mo.style.background_gradient(cmap="RdYlGn", vmin=-3, vmax=3, subset=["單日%"])
+                    .background_gradient(cmap="RdYlGn", vmin=-30, vmax=30, subset=["本月%", "今年%"])
+                    .format({c: "{:+.2f}%" for c in ["單日%", "本月%", "今年%"]}, na_rep="—"),
+                    use_container_width=True, hide_index=True, height=420)
+        st.caption("商品/MSCI/期貨來源 StockQ。列印 Ctrl+P。")
+
+    # ══ 📊 漲跌排行（StockQ /market/：各期間最漲最跌，live）══
+    with tab_movers:
+        _icon_title("scan", "漲跌排行（StockQ 全球股市）")
+        st.caption("各期間表現最好/最差的股市。綠漲紅跌(我們慣例)。live 抓 StockQ、約5分快取。")
+        _mt = _stockq_tables("https://www.stockq.org/market/")
+        if not _mt:
+            st.warning("暫時無法連線 StockQ（或該站結構調整）。稍後再試。")
+        else:
+            # 收集 2 欄(股市, 漲跌幅%) 的排行表
+            movers = []
+            for t in _mt:
+                if t.shape[1] == 2 and len(t) >= 4:
+                    c = t.copy()
+                    c.columns = ["股市", "漲跌幅"]
+                    c["漲跌幅%"] = c["漲跌幅"].map(_sq_pct_to_num)
+                    c = c[c["漲跌幅%"].notna()]
+                    if len(c) >= 4 and c["股市"].astype(str).str.contains("%").sum() == 0:
+                        movers.append(c[["股市", "漲跌幅%"]].reset_index(drop=True))
+            if not movers:
+                st.warning("StockQ 排行結構可能調整，暫時解析不到。跟我說我修解析。")
+            else:
+                _periods = ["一日", "一週", "兩週", "本月以來", "一個月", "兩個月",
+                            "三個月", "六個月", "今年以來", "一年", "從今年高點", "從今年低點"]
+                half = len(movers) // 2
+                sel = st.selectbox("期間", _periods[:max(1, half)], key="mv_period")
+                idx = _periods.index(sel)
+                cc = st.columns(2)
+                if idx < len(movers):
+                    with cc[0]:
+                        st.markdown("**📈 表現最好（{}）**".format(sel))
+                        b = movers[idx]
+                        st.dataframe(b.style.background_gradient(cmap="RdYlGn", vmin=-5, vmax=5,
+                                                                 subset=["漲跌幅%"])
+                                     .format({"漲跌幅%": "{:+.2f}%"}),
+                                     use_container_width=True, hide_index=True, height=460)
+                if half + idx < len(movers):
+                    with cc[1]:
+                        st.markdown("**📉 表現最差（{}）**".format(sel))
+                        w = movers[half + idx]
+                        st.dataframe(w.style.background_gradient(cmap="RdYlGn", vmin=-5, vmax=5,
+                                                                 subset=["漲跌幅%"])
+                                     .format({"漲跌幅%": "{:+.2f}%"}),
+                                     use_container_width=True, hide_index=True, height=460)
+            st.caption("來源 StockQ /market/。列印 Ctrl+P。")
 
     # ══ 筆記（手動、可下載保存；取代自動追蹤日誌）══
     with tab_notes:
