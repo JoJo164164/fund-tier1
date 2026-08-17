@@ -659,15 +659,6 @@ def _stockq_tables(url):
         return []
 
 
-def _sq_find(tables, *keywords):
-    """在多張表裡找第一張『內容含全部關鍵字』的表。"""
-    for t in tables:
-        blob = " ".join(str(x) for x in t.values.ravel()[:200])
-        if all(k in blob for k in keywords):
-            return t
-    return None
-
-
 def _sq_pct_to_num(s):
     try:
         return float(str(s).replace("%", "").replace(",", "").strip())
@@ -676,35 +667,45 @@ def _sq_pct_to_num(s):
 
 
 # ══════════════════════════════════════════════════════════════
-# StockQ 解析防彈化 + 格狀版面（②：市場狀況/漲跌排行仿 StockQ）
-#   ★根因修復★：舊 _render_sq 把欄位改名 "0".."N" 後硬寫死「第3欄=漲跌幅」，
-#   StockQ 一改版該欄不存在 → KeyError → 因 Streamlit 全 tab 同時執行 → 整站掛。
-#   對策：改「內容偵測欄位」(找含 % 的欄) + 每張表 try/except 隔離，任何結構
-#   變動只降級顯示提示、絕不再拖垮全站。配色維持我們慣例：綠漲紅跌。
+# StockQ 卡片框架（②：市場狀況/漲跌排行仿 StockQ 版面）
+#   設計：一張 StockQ 表 → 一張密集卡片，欄位用「內容偵測」自動辨識
+#   (名稱/數值/漲跌/比例%/時間)，保留每列時間 + 卡頭顯示更新時間。
+#   配色維持我們慣例：綠漲紅跌(鐵律30)。每卡 try/except，結構變動只降級不崩。
+#   ★根因：舊 _render_sq 硬寫死欄位索引 → StockQ 改版即 KeyError → 全站崩。
 # ══════════════════════════════════════════════════════════════
+import re as _sqre
+
+_SQ_TIME_RE = _sqre.compile(r"^\s*(\d{1,2}:\d{2}|\d{1,2}/\d{1,2})\s*$")
+
+
 def _sq_esc(s):
-    """HTML 轉義（塞進 st.markdown(unsafe_allow_html) 前用）。"""
     return (str(s).replace("&", "&amp;").replace("<", "&lt;")
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
-def _sq_pct_cols(df):
-    """回傳所有『像漲跌幅%』的欄索引：cell 含 '%' 比例 ≥30% 的欄，依比例高→低。"""
-    n = len(df)
-    if n == 0:
-        return []
-    scored = []
-    for i in range(df.shape[1]):
-        col = df.iloc[:, i].astype(str)
-        ratio = col.str.contains("%", na=False).sum() / n
-        if ratio >= 0.3:
-            scored.append((ratio, i))
-    scored.sort(reverse=True)
-    return [i for _, i in scored]
+def _sq_num(s):
+    try:
+        return float(str(s).replace("%", "").replace(",", "").replace("+", "").strip())
+    except Exception:
+        return None
+
+
+def _sq_col_is_time(col):
+    n = len(col)
+    if not n:
+        return False
+    return col.astype(str).str.match(_SQ_TIME_RE).sum() / n >= 0.4
+
+
+def _sq_col_is_pct(col):
+    n = len(col)
+    if not n:
+        return False
+    return col.astype(str).str.contains("%", na=False).sum() / n >= 0.3
 
 
 def _sq_name_col(df):
-    """回傳『名稱欄』索引：第一個多為非數字文字的欄；找不到回 0。"""
+    """名稱欄索引：第一個多為非數字文字的欄；找不到回 0。"""
     n = len(df)
     for i in range(df.shape[1]):
         col = df.iloc[:, i].astype(str)
@@ -715,82 +716,184 @@ def _sq_name_col(df):
     return 0
 
 
-def _sq_sign_style(v):
-    """依正負回 (文字色, 邊框色, 底色, 正號)。綠漲紅跌(我們慣例，鐵律30)。"""
-    if v is None:
-        return "#414141", "#B5DAE6", "#F5F9FB", ""
-    if v > 0:
-        return "#00908D", "#00908D", "#EAF6F5", "+"
-    if v < 0:
-        return "#F62459", "#F62459", "#FDECEF", ""
-    return "#414141", "#B5DAE6", "#F5F9FB", ""
+def _sq_find(tables, *keywords):
+    """在多張表裡找第一張『內容含全部關鍵字』的表（覆蓋原同名函式，加防呆）。"""
+    for t in tables:
+        try:
+            blob = " ".join(str(x) for x in t.values.ravel()[:400])
+        except Exception:
+            continue
+        if all(k in blob for k in keywords):
+            return t
+    return None
 
 
-def _sq_grid(items, min_px=140):
-    """格狀磚牆：items=[(名稱, 漲跌%[, 副標])]。仿 StockQ 首頁格狀。"""
-    cells = []
-    for it in items:
-        nm, v = it[0], it[1]
-        sub = it[2] if len(it) > 2 else None
-        fg, bd, bg, sign = _sq_sign_style(v)
-        vtxt = "—" if v is None else "{}{:.2f}%".format(sign, v)
-        sub_html = ('<div style="font-size:.72rem;color:#414141">{}</div>'
-                    .format(_sq_esc(sub))) if sub else ""
-        cells.append(
-            '<div style="border:1px solid {bd};border-radius:8px;padding:7px 9px;'
-            'background:{bg};min-width:0">'
-            '<div style="font-size:.8rem;color:#122B54;white-space:nowrap;overflow:hidden;'
-            'text-overflow:ellipsis" title="{full}">{nm}</div>'
-            '{sub}'
-            '<div style="font-size:1.05rem;font-weight:700;color:{fg}">{v}</div>'
-            '</div>'.format(bd=bd, bg=bg, fg=fg, full=_sq_esc(nm),
-                            nm=_sq_esc(nm), sub=sub_html, v=vtxt))
-    html = ('<div style="display:grid;grid-template-columns:'
-            'repeat(auto-fill,minmax({}px,1fr));gap:8px;margin:2px 0 12px">{}</div>'
-            .format(min_px, "".join(cells)))
-    st.markdown(html, unsafe_allow_html=True)
+_SQ_CSS = """
+<style>
+.sqwall{display:grid;gap:12px;align-items:start;margin:6px 0 12px}
+.sqcard{border:1px solid #B5DAE6;border-radius:10px;overflow:hidden;background:#fff}
+.sqhd{background:#003781;color:#fff;font-weight:700;font-size:.9rem;padding:6px 10px;
+ display:flex;justify-content:space-between;align-items:center;gap:8px}
+.sqhd .upd{font-weight:400;font-size:.7rem;color:#B5DAE6;white-space:nowrap}
+.sqbody{max-height:380px;overflow:auto}
+.sqtab{width:100%;border-collapse:collapse;font-size:.78rem}
+.sqtab th{background:#DFEFF2;color:#003781;padding:3px 8px;text-align:right;
+ position:sticky;top:0;white-space:nowrap;z-index:1}
+.sqtab th:first-child{text-align:left}
+.sqtab td{padding:3px 8px;border-bottom:1px solid #EEF4F7;text-align:right;white-space:nowrap}
+.sqtab td:first-child{text-align:left;color:#122B54;max-width:140px;overflow:hidden;
+ text-overflow:ellipsis}
+.sqtab tr:nth-child(even) td{background:#FAFCFD}
+.sqU{color:#00908D;font-weight:600}
+.sqD{color:#F62459;font-weight:600}
+.sqZ{color:#414141}
+.sqrk .rk{color:#003781;font-weight:700;margin-right:5px}
+</style>
+"""
 
 
-def _sq_rank(items):
-    """排行榜卡：items=[(名稱, 漲跌%)]，已排序。仿 StockQ /market/ 名次榜。"""
-    rows = []
-    for i, (nm, v) in enumerate(items, 1):
-        fg, _bd, _bg, sign = _sq_sign_style(v)
-        vtxt = "—" if v is None else "{}{:.2f}%".format(sign, v)
-        rows.append(
-            '<div style="display:flex;justify-content:space-between;align-items:center;'
-            'gap:8px;padding:6px 11px;border-bottom:1px solid #E9F1F4">'
-            '<span style="color:#122B54;white-space:nowrap;overflow:hidden;'
-            'text-overflow:ellipsis"><b style="color:#003781">{i}.</b> {nm}</span>'
-            '<b style="color:{fg};white-space:nowrap">{v}</b></div>'
-            .format(i=i, nm=_sq_esc(nm), fg=fg, v=vtxt))
-    st.markdown('<div style="border:1px solid #B5DAE6;border-radius:10px;overflow:hidden;'
-                'margin-bottom:6px">{}</div>'.format("".join(rows)),
-                unsafe_allow_html=True)
+def _sq_sign(val, force_sign=False):
+    """回 (css_class, 顯示文字)；正綠負紅。"""
+    txt = str(val).strip()
+    if txt.lower() in ("nan", ""):
+        return "", ""
+    num = _sq_num(val)
+    if num is None:
+        return "", _sq_esc(txt)
+    cls = "sqU" if num > 0 else ("sqD" if num < 0 else "sqZ")
+    if force_sign and num > 0 and not txt.startswith("+"):
+        txt = "+" + txt
+    return cls, _sq_esc(txt)
 
 
-def _sq_render_change_table(df, title, min_px=150):
-    """把一張 StockQ 表(名稱+單一漲跌%)畫成格狀。解析不到只降級提示，不 raise。"""
+def _sq_card_from_df(df, title, max_rows=80):
+    """任何 StockQ 行情表 → 密集卡片(原欄位+每列時間+綠漲紅跌)。回 HTML 字串。
+    解析不到回降級卡片，永不 raise。"""
     try:
         if df is None or len(df) == 0:
-            return
+            return ""
         d = df.copy()
+        d.columns = [(" ".join(str(x) for x in c) if isinstance(c, tuple) else str(c))
+                     for c in d.columns]
+        ncol = d.shape[1]
+        cols = list(d.columns)
+        is_pct = [_sq_col_is_pct(d.iloc[:, i]) for i in range(ncol)]
+        is_time = [_sq_col_is_time(d.iloc[:, i]) for i in range(ncol)]
         name_i = _sq_name_col(d)
-        pcts = _sq_pct_cols(d)
-        if not pcts:
-            return
-        pct_i = pcts[0]
-        names = d.iloc[:, name_i].astype(str)
-        vals = d.iloc[:, pct_i].map(_sq_pct_to_num)
-        items = [(nm, v) for nm, v in zip(names, vals)
-                 if v is not None and nm and nm.lower() != "nan"]
-        if not items:
-            return
-        st.markdown("**{}**".format(title))
-        _sq_grid(items, min_px=min_px)
+        hdr_chg = ["漲跌" in str(cols[i]) for i in range(ncol)]
+
+        def _hdr(i):
+            c = str(cols[i])
+            if c.startswith("Unnamed") or _sqre.fullmatch(r"\d+", c):
+                if i == name_i:
+                    return "名稱"
+                if is_time[i]:
+                    return "時間"
+                if is_pct[i]:
+                    return "比例"
+                return ""
+            return c
+
+        # 代表更新時間 = 最右時間欄的眾數
+        upd = ""
+        for i in range(ncol - 1, -1, -1):
+            if is_time[i]:
+                vals = [x for x in d.iloc[:, i].astype(str) if _SQ_TIME_RE.match(str(x))]
+                if vals:
+                    upd = max(set(vals), key=vals.count)
+                break
+
+        thead = "".join("<th>{}</th>".format(_sq_esc(_hdr(i))) for i in range(ncol))
+        body = []
+        shown = 0
+        for _, row in d.iterrows():
+            nm = str(row.iloc[name_i])
+            if nm.strip().lower() in ("nan", ""):
+                continue
+            # 至少要有一個數值欄(擋掉夾在中間的標題列)
+            num_cnt = sum(1 for i in range(ncol)
+                          if i != name_i and _sq_num(row.iloc[i]) is not None)
+            if num_cnt == 0:
+                continue
+            tds = []
+            for i in range(ncol):
+                val = str(row.iloc[i])
+                if val.strip().lower() == "nan":
+                    val = ""
+                if i == name_i:
+                    tds.append("<td>{}</td>".format(_sq_esc(val)))
+                elif is_pct[i] or hdr_chg[i]:
+                    cls, txt = _sq_sign(val, force_sign=is_pct[i])
+                    tds.append('<td class="{}">{}</td>'.format(cls, txt))
+                else:
+                    tds.append("<td>{}</td>".format(_sq_esc(val)))
+            body.append("<tr>" + "".join(tds) + "</tr>")
+            shown += 1
+            if shown >= max_rows:
+                break
+        if shown == 0:
+            return ""
+        upd_html = '<span class="upd">更新 {}</span>'.format(_sq_esc(upd)) if upd else ""
+        return ('<div class="sqcard"><div class="sqhd"><span>{t}</span>{u}</div>'
+                '<div class="sqbody"><table class="sqtab"><thead><tr>{th}</tr></thead>'
+                '<tbody>{tb}</tbody></table></div></div>'
+                ).format(t=_sq_esc(title), u=upd_html, th=thead, tb="".join(body))
     except Exception:
-        st.caption("（{} 解析失敗，StockQ 結構可能已調整——把該頁 HTML 貼我，我修欄位對映）"
-                   .format(title))
+        return ('<div class="sqcard"><div class="sqhd"><span>{t}</span></div>'
+                '<div style="padding:8px 10px;font-size:.78rem;color:#414141">'
+                '解析失敗，StockQ 結構可能已調整——把該頁 HTML 貼我，我修對映。</div></div>'
+                ).format(t=_sq_esc(title))
+
+
+def _quote_card_html(title, items, price_hdr="現價", update=""):
+    """自有資料(yfinance)組同款卡片。items=[(名稱, 價格字串, 漲跌%float, 漲跌點float或None)]。"""
+    body = []
+    for it in items:
+        nm, price, pct = it[0], it[1], it[2]
+        chg = it[3] if len(it) > 3 else None
+        pcls = "sqU" if (pct or 0) > 0 else ("sqD" if (pct or 0) < 0 else "sqZ")
+        ptxt = "—" if pct is None else "{:+.2f}%".format(pct)
+        ccls = "sqU" if (chg or 0) > 0 else ("sqD" if (chg or 0) < 0 else "sqZ")
+        ctxt = "" if chg is None else "{:+,.2f}".format(chg)
+        body.append('<tr><td>{nm}</td><td>{pr}</td><td class="{cc}">{ct}</td>'
+                    '<td class="{pc}">{pt}</td></tr>'.format(
+                        nm=_sq_esc(nm), pr=_sq_esc(price), cc=ccls, ct=ctxt,
+                        pc=pcls, pt=ptxt))
+    if not body:
+        return ""
+    upd_html = '<span class="upd">更新 {}</span>'.format(_sq_esc(update)) if update else ""
+    return ('<div class="sqcard"><div class="sqhd"><span>{t}</span>{u}</div>'
+            '<div class="sqbody"><table class="sqtab"><thead><tr>'
+            '<th>名稱</th><th>{ph}</th><th>漲跌</th><th>比例</th></tr></thead>'
+            '<tbody>{tb}</tbody></table></div></div>'
+            ).format(t=_sq_esc(title), u=upd_html, ph=_sq_esc(price_hdr), tb="".join(body))
+
+
+def _sq_rank_card_html(title, items):
+    """漲跌排行單一期間卡：items=[(名稱, 漲跌%float)]，已排序。"""
+    body = []
+    for i, (nm, v) in enumerate(items, 1):
+        cls = "sqU" if (v or 0) > 0 else ("sqD" if (v or 0) < 0 else "sqZ")
+        vtxt = "—" if v is None else "{:+.2f}%".format(v)
+        body.append('<tr><td><span class="rk">{i}</span>{nm}</td>'
+                    '<td class="{c}">{v}</td></tr>'.format(
+                        i=i, nm=_sq_esc(nm), c=cls, v=vtxt))
+    if not body:
+        return ""
+    return ('<div class="sqcard"><div class="sqhd"><span>{t}</span></div>'
+            '<div class="sqbody"><table class="sqtab sqrk"><tbody>{tb}</tbody>'
+            '</table></div></div>').format(t=_sq_esc(title), tb="".join(body))
+
+
+def _sq_wall(card_htmls, min_px=300):
+    """多張卡片組成響應式卡片牆(仿 StockQ 多欄，自動換行)。"""
+    cards = [c for c in card_htmls if c]
+    if not cards:
+        return False
+    html = (_SQ_CSS + '<div class="sqwall" style="grid-template-columns:'
+            'repeat(auto-fill,minmax({}px,1fr))">{}</div>'.format(min_px, "".join(cards)))
+    st.markdown(html, unsafe_allow_html=True)
+    return True
 
 
 # ── 全球現貨指數（yfinance，我們技術棧已用）：亞洲/歐洲/美洲 ──
@@ -2275,89 +2378,76 @@ def main():
             st.caption("報酬為官方數字(MoneyDJ,考慮配息)。發行公司/系列以基金名對應官方分類，"
                        "對不到者不顯示該欄。風險指標(標準差/Sharpe)因境內來源未提供，改於個別分析呈現。")
 
-    # ══ 🌍 市場狀況（現貨指數 yfinance + 商品/MSCI/期貨 StockQ）══
-    #   ② 版面改造：仿 StockQ 首頁格狀磚牆；StockQ 解析全面防彈(內容偵測欄位+try/except)。
+    # ══ 🌍 市場狀況（StockQ 全站多表 → 卡片牆；yfinance 現貨當自有補充/後備）══
     with tab_mkt:
-        _icon_title("cmp", "市場狀況（全球現貨指數）")
-        st.caption("全球現貨指數(亞洲/歐洲/美洲) + 商品 + MSCI + 指數期貨。綠漲紅跌(我們慣例)。"
-                   "現貨指數 live 抓 yfinance；商品/MSCI/期貨抓 StockQ。約5分快取。")
+        _icon_title("cmp", "市場狀況（全球行情）")
+        st.caption("全球股市指數 + 全球金融 + 商品 + 匯率 + MSCI + 期貨 + 債券，含各列更新時間。"
+                   "綠漲紅跌(我們慣例)。多數 live 抓 StockQ、現貨指數抓 yfinance。約5分快取。")
 
-        # ── 現貨指數（yfinance）→ 格狀磚牆（現價當副標，漲跌%當主值）──
+        _tabs = _stockq_tables("https://www.stockq.org/")
+        got_any = False
+
+        # ── StockQ 首頁多表：關鍵字定位 → 通用卡片(自動辨識欄位+每列時間) ──
+        # spec: (卡片標題, [必含關鍵字])；找不到就跳過(不崩、不假裝)
+        _SPECS = [
+            ("亞洲股市指數", ["日經225", "韓國"]),
+            ("歐洲/非洲股市指數", ["德國股市", "法國股市"]),
+            ("美國股市指數", ["費城半導體", "NASDAQ"]),
+            ("全球金融行情", ["比特幣", "SCFI運價"]),
+            ("金融/地產", ["NYSE金融", "NASDAQ銀行"]),
+            ("羅傑斯/高盛商品", ["CRB指數", "Rogers商品"]),
+            ("商品價格", ["黃金", "白銀"]),
+            ("全球匯率", ["歐元/美元", "美元/日圓"]),
+            ("MSCI 指數", ["世界指數", "新興市場"]),
+            ("全球指數期貨", ["台指期"]),
+            ("債券指數", ["殖利率"]),
+        ]
+        if _tabs:
+            cards = []
+            for title, kws in _SPECS:
+                df = _sq_find(_tabs, *kws)
+                if df is None and len(kws) > 1:       # 放寬：只用首個關鍵字再試一次
+                    df = _sq_find(_tabs, kws[0])
+                if df is not None:
+                    html = _sq_card_from_df(df, title)
+                    if html:
+                        cards.append(html)
+            if cards:
+                got_any = _sq_wall(cards, min_px=310)
+        if not got_any:
+            st.info("StockQ 暫時無法連線或結構調整；以下改用 yfinance 現貨指數。")
+
+        # ── 自有資料：yfinance 現貨指數（同款卡片；StockQ 掛掉時的後備、平時當我方對照）──
         spot = load_spot_indices()
-        if not spot:
-            st.warning("現貨指數暫時抓取失敗（yfinance 連線或未安裝）。確認 requirements.txt 含 yfinance。")
-        else:
+        if spot:
+            st.markdown("###### 現貨指數（yfinance · 我方對照）")
+            spot_cards = []
             for region, lst in _INDEX_MAP.items():
                 items = []
                 for nm, _t in lst:
                     if nm in spot:
                         p, c, pct = spot[nm]
-                        sub = "{:,.2f}  ({:+,.2f})".format(p, c)
-                        items.append((nm, pct, sub))
-                if not items:
-                    continue
-                st.markdown("**{}股市指數**".format(region))
-                _sq_grid(items, min_px=160)
-            st.caption("現貨指數來源 yfinance（Yahoo），漲跌%＝對前一交易日收盤。副標＝現價(漲跌點數)。")
+                        items.append((nm, "{:,.2f}".format(p), pct, c))
+                if items:
+                    spot_cards.append(_quote_card_html(region + "股市指數", items,
+                                                        price_hdr="現價"))
+            _sq_wall(spot_cards, min_px=280)
+        elif not got_any:
+            st.warning("yfinance 現貨指數也抓取失敗；請確認 requirements.txt 含 yfinance、稍後再試。")
 
-        st.markdown("---")
-        # ── 商品 / MSCI / 期貨（StockQ）→ 格狀；欄位內容偵測，任何結構變動只降級不崩 ──
-        _tabs = _stockq_tables("https://www.stockq.org/")
-        if not _tabs:
-            st.info("StockQ 商品/MSCI/期貨暫時無法連線。")
-        else:
-            com = _sq_find(_tabs, "黃金", "買價")
-            if com is None:
-                com = _sq_find(_tabs, "黃金")
-            _sq_render_change_table(com, "商品價格", min_px=150)
+        st.caption("來源：StockQ（各表右上為該表更新時間）＋ yfinance 現貨。列印 Ctrl+P。")
 
-            fut = _sq_find(_tabs, "台指期")
-            _sq_render_change_table(fut, "全球指數期貨", min_px=150)
-
-            # MSCI：多期間(單日/本月/今年)，取名稱欄 + 前三個 % 欄；解析不到只降級
-            try:
-                msci = _sq_find(_tabs, "世界指數") or _sq_find(_tabs, "AC世界指數")
-                if msci is not None and len(msci) > 0:
-                    d = msci.copy()
-                    name_i = _sq_name_col(d)
-                    pcols = _sq_pct_cols(d)
-                    if pcols:
-                        # StockQ MSCI 由左到右＝單日/本月/今年，故 % 欄按欄位順序取前三
-                        pcols_lr = sorted(pcols)[:3]
-                        labels = ["單日%", "本月%", "今年%"][:len(pcols_lr)]
-                        names = d.iloc[:, name_i].astype(str)
-                        series = [d.iloc[:, ci].map(_sq_pct_to_num) for ci in pcols_lr]
-                        st.markdown("**MSCI 指數**")
-                        # 用主值=最後一個可得期間(通常今年%)，其餘期間放副標
-                        items = []
-                        for r in range(len(d)):
-                            nm = str(names.iloc[r])
-                            if not nm or nm.lower() == "nan":
-                                continue
-                            vals = [s.iloc[r] for s in series]
-                            main_v = next((v for v in reversed(vals) if v is not None), None)
-                            if main_v is None:
-                                continue
-                            sub = "  ".join("{}{:+.2f}%".format(labels[k], vals[k])
-                                            for k in range(len(vals)) if vals[k] is not None)
-                            items.append((nm, main_v, sub))
-                        if items:
-                            _sq_grid(items, min_px=200)
-            except Exception:
-                st.caption("（MSCI 解析失敗，StockQ 結構可能已調整——把該頁 HTML 貼我，我修欄位對映）")
-        st.caption("商品/MSCI/期貨來源 StockQ。列印 Ctrl+P。")
-
-    # ══ 📊 漲跌排行（StockQ /market/：各期間最漲最跌，live）══
-    #   ② 版面改造：改 StockQ 名次榜(左最漲/右最跌)；解析全段 try/except，結構變動只降級。
+    # ══ 📊 漲跌排行（StockQ /market/：所有期間一次展開，上漲下跌兩牆）══
     with tab_movers:
         _icon_title("scan", "漲跌排行（StockQ 全球股市）")
-        st.caption("各期間表現最好/最差的股市。綠漲紅跌(我們慣例)。live 抓 StockQ、約5分快取。")
+        st.caption("各期間表現最好/最差的股市，所有期間一次展開。綠漲紅跌(我們慣例)。"
+                   "live 抓 StockQ、約5分快取。")
         _mt = _stockq_tables("https://www.stockq.org/market/")
         if not _mt:
             st.warning("暫時無法連線 StockQ（或該站結構調整）。稍後再試。")
         else:
             try:
-                # 收集 2 欄(股市, 漲跌幅%) 的排行表
+                # 收集 2 欄(股市, 漲跌幅%) 的排行表；前半＝各期間漲、後半＝各期間跌
                 movers = []
                 for t in _mt:
                     if t.shape[1] == 2 and len(t) >= 4:
@@ -2373,19 +2463,23 @@ def main():
                     _periods = ["一日", "一週", "兩週", "本月以來", "一個月", "兩個月",
                                 "三個月", "六個月", "今年以來", "一年", "從今年高點", "從今年低點"]
                     half = len(movers) // 2
-                    sel = st.selectbox("期間", _periods[:max(1, half)], key="mv_period")
-                    idx = _periods.index(sel)
-                    cc = st.columns(2)
-                    if idx < len(movers):
-                        with cc[0]:
-                            st.markdown("**📈 表現最好（{}）**".format(sel))
-                            b = movers[idx]
-                            _sq_rank(list(zip(b["股市"].astype(str), b["漲跌幅%"])))
-                    if half + idx < len(movers):
-                        with cc[1]:
-                            st.markdown("**📉 表現最差（{}）**".format(sel))
-                            w = movers[half + idx]
-                            _sq_rank(list(zip(w["股市"].astype(str), w["漲跌幅%"])))
+
+                    def _label(i):
+                        return _periods[i] if i < len(_periods) else "期間{}".format(i + 1)
+
+                    # 上牆：各期間「漲最多」
+                    st.markdown("#### 📈 各期間表現最好")
+                    up_cards = [_sq_rank_card_html(_label(i), list(zip(
+                        movers[i]["股市"].astype(str), movers[i]["漲跌幅%"])))
+                        for i in range(half)]
+                    _sq_wall(up_cards, min_px=190)
+
+                    # 下牆：各期間「跌最多」
+                    st.markdown("#### 📉 各期間表現最差")
+                    dn_cards = [_sq_rank_card_html(_label(i), list(zip(
+                        movers[half + i]["股市"].astype(str), movers[half + i]["漲跌幅%"])))
+                        for i in range(half) if half + i < len(movers)]
+                    _sq_wall(dn_cards, min_px=190)
             except Exception:
                 st.warning("StockQ 排行解析失敗（結構可能已調整）。把 /market/ 頁 HTML 貼我，我修解析。")
             st.caption("來源 StockQ /market/。列印 Ctrl+P。")
