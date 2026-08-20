@@ -1,0 +1,65 @@
+name: 步驟1 · 搬移 data 到 Release(保住已建好的歷史資料)
+
+# 一次性：把現有 data/ 全部上傳到本 repo 的 Release(tag=data-latest)。
+# 只「新增 Release + 上傳檔案」，不刪檔、不改歷史、不動 repo → 零風險。
+# 跑法：Actions 分頁 → 選本 workflow → Run workflow。跑完到 repo 首頁右側 Releases 看檔。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rescue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: 取出目前檔案(淺層，只要工作區、不拉肥歷史)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 檢視 data/ 內容與大小
+        run: |
+          if [ ! -d data ]; then echo "❌ 找不到 data/ 資料夾"; exit 1; fi
+          echo "===== data/ 檔案清單 ====="
+          ls -lh data/
+          echo "===== data/ 總大小 ====="
+          du -sh data/
+          echo "===== 檔案數 ====="
+          ls data/ | wc -l
+
+      - name: 建立/更新 Release 並上傳所有資料檔
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          # 沒有 data-latest 這個 release 才建立(已存在就沿用)
+          if ! gh release view data-latest >/dev/null 2>&1; then
+            gh release create data-latest \
+              --title "資料庫快照(app 由此讀取)" \
+              --notes "境內(SITCA)+境外(cnyes/yfinance)+績效(MoneyDJ)歷史庫。由 workflow 自動維護。"
+            echo "已建立 release: data-latest"
+          else
+            echo "release data-latest 已存在，沿用"
+          fi
+          shopt -s nullglob
+          files=(data/*.csv data/*.json)
+          if [ ${#files[@]} -eq 0 ]; then echo "❌ data/ 內沒有 csv/json"; exit 1; fi
+          echo "將上傳 ${#files[@]} 個檔案到 Release(同名覆蓋)…"
+          # 分批上傳，避免一次太多；--clobber 同名覆蓋
+          gh release upload data-latest "${files[@]}" --clobber
+          echo "✅ 上傳完成"
+
+      - name: 驗證(資產數 + 各檔大小)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          n=$(gh release view data-latest --json assets -q '.assets | length')
+          echo "Release 現有資產數：$n"
+          if [ "$n" -lt 3 ]; then echo "❌ 資產太少，疑似上傳失敗"; exit 1; fi
+          echo "===== Release 資產清單(名稱 / bytes) ====="
+          gh release view data-latest --json assets -q '.assets[] | "\(.name)\t\(.size)"'
+          echo "✅ 驗證通過：資料已安全存進 Release，可安心進行下一步瘦身。"
