@@ -1,0 +1,33 @@
+name: 建置 基金績效Ranking (MoneyDJ)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 15 * * 1-5'   # 週一~五 台北 23:00
+
+permissions:
+  contents: write
+
+jobs:
+  perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: pip install requests pandas lxml html5lib
+      - name: 抓 MoneyDJ 績效+排名(全量重爬)
+        run: python -u build_performance.py
+      - name: 上傳 performance.csv 到 Release(不再進 git)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          test -f data/performance.csv || { echo "❌ 沒產出 performance.csv"; exit 1; }
+          gh release view data-latest >/dev/null 2>&1 || \
+            gh release create data-latest --title "資料庫快照(app 由此讀取)" --notes "自動維護"
+          gh release upload data-latest data/performance.csv --clobber
+          echo "✅ performance.csv 已上傳 Release"

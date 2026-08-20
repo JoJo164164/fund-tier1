@@ -1,0 +1,110 @@
+name: 建置 境外基金淨值庫 (cnyes+yfinance)
+
+on:
+  schedule:
+    - cron: '30 14 * * 1-5'   # 週一~五 台北 22:30
+  workflow_dispatch:
+    inputs:
+      parallel:
+        description: '平行分段數(1-20)'
+        required: true
+        default: '10'
+      sleep:
+        description: '每檔 yfinance 間隔秒'
+        required: true
+        default: '0.5'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: offshore-data-write
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      segments: ${{ steps.gen.outputs.segments }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests
+      - name: 列出全境外清單
+        env:
+          OFFSHORE_MODE: enumerate
+        run: python -u build_offshore.py
+      - name: 上傳清單
+        uses: actions/upload-artifact@v4
+        with:
+          name: offshore-universe
+          path: data/offshore_universe.csv
+          retention-days: 1
+      - id: gen
+        run: |
+          N=${{ github.event.inputs.parallel || '10' }}
+          echo "segments=$(python3 -c "print([i for i in range($N)])")" >> $GITHUB_OUTPUT
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        segment: ${{ fromJson(needs.prepare.outputs.segments) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests yfinance
+      - uses: actions/download-artifact@v4
+        with:
+          name: offshore-universe
+          path: data
+      - name: 抓本段歷史(第${{ matrix.segment }}段)
+        env:
+          PYTHONUNBUFFERED: '1'
+          OFFSHORE_MODE: fetch
+          SEGMENT_TOTAL: ${{ github.event.inputs.parallel || '10' }}
+          SEGMENT_INDEX: ${{ matrix.segment }}
+          OFFSHORE_SLEEP: ${{ github.event.inputs.sleep || '0.5' }}
+        run: python -u build_offshore.py
+      - name: 上傳本段
+        uses: actions/upload-artifact@v4
+        with:
+          name: seg-${{ matrix.segment }}
+          path: data/offshore_nav_seg*.csv
+          retention-days: 1
+
+  merge:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: _segs
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests
+      - name: 合併分段 → data/offshore_nav_*.csv(全量重建)
+        run: python3 merge_offshore.py
+      - name: 上傳境外庫 + coverage 到 Release(不再進 git)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          shopt -s nullglob
+          files=(data/offshore_nav_*.csv data/coverage_offshore.json)
+          [ ${#files[@]} -gt 0 ] || { echo "❌ 沒有境外檔可上傳"; exit 1; }
+          gh release view data-latest >/dev/null 2>&1 || \
+            gh release create data-latest --title "資料庫快照(app 由此讀取)" --notes "自動維護"
+          gh release upload data-latest "${files[@]}" --clobber
+          echo "✅ 境外庫($(( ${#files[@]} ))檔)已上傳 Release"

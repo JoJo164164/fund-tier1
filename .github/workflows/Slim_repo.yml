@@ -1,0 +1,57 @@
+name: 步驟2 · 瘦身 repo(重置歷史，只留程式碼)
+
+# 一次性：把 main 歷史重置成單一 commit(不含 data/)，讓 clone 秒過。
+# 【安全設計】跑之前(1)要手動輸入 YES (2)會再驗 Release 有足量資料，缺一即中止、絕不動歷史。
+# data/ 檔案內容不會消失(已在 Release、且工作區仍在)，消失的只有每天累積的肥歷史。
+# 跑法：Actions → 選本 workflow → Run workflow → confirm 欄輸入 YES。
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: '輸入 YES 確認重置 main 歷史(資料已在 Release 才輸)'
+        required: true
+        default: 'NO'
+
+permissions:
+  contents: write
+
+jobs:
+  slim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: 前置確認(沒打 YES 就中止)
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "YES" ]; then
+            echo "❌ 未輸入 YES → 中止(安全)。確定要瘦身再輸 YES。"; exit 1
+          fi
+
+      - name: 取出目前檔案(淺層，不拉肥歷史)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 動手前再驗一次 Release 有足量資料(不足即中止，絕不瘦身)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n=$(gh release view data-latest --json assets -q '.assets | length' 2>/dev/null || echo 0)
+          echo "Release 資產數：$n"
+          if [ "$n" -lt 10 ]; then
+            echo "❌ Release 資料不足($n<10)，中止瘦身(先跑步驟1把 data 搬上 Release)。"; exit 1
+          fi
+          echo "✅ Release 有 $n 個資產，資料安全，繼續瘦身。"
+
+      - name: 重置 main 為單一 commit(不含 data/)
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm -rf data                      # data 已在 Release，工作區移除不入版本
+          git checkout --orphan _clean     # 全新無父 commit
+          git add -A                        # 收所有現存檔(.gitignore 已排除 data/)
+          git commit -m "chore: 重置歷史，資料改由 Release(data-latest)提供，app 按需下載"
+          echo "推送(取代 main)…若此步報 'shallow' 錯誤，告訴我，我把 fetch-depth 改 0。"
+          git push -f origin _clean:main
+          echo "✅ 已重置 main。新 clone 只含程式碼，Streamlit 應可秒 clone。"

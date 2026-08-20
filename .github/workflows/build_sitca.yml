@@ -1,0 +1,132 @@
+name: 建置 SITCA 基金淨值歷史庫
+
+# ⚠️ 本 workflow 是「全量重建」：會用抓到的資料【取代】Release 上的 SITCA seg 檔。
+#    請用大的 days_back(如 ALL/3800)整段重建。日常增量請用「每日補最新 SITCA」(append)，勿用本工具補幾天。
+
+on:
+  workflow_dispatch:
+    inputs:
+      companies:
+        description: 'ALL=所有公司 ｜留空=逐家 ｜或填代碼如A0036,A0032'
+        required: true
+        default: 'ALL'
+      days_back:
+        description: '往回抓幾個營業日。全量請填大：5年1250；15年3800'
+        required: true
+        default: '3800'
+      parallel:
+        description: '平行分段數(1-20)'
+        required: true
+        default: '10'
+      skip_recent:
+        description: '跳過最近幾個營業日'
+        required: true
+        default: '2'
+      start_date:
+        description: '起始日 YYYYMMDD(留空=從今天往回)'
+        required: false
+        default: ''
+      filter_companies:
+        description: '只存哪些投信(留空=全部)'
+        required: false
+        default: ''
+      filter_assets:
+        description: '只存哪些資產類型(留空=全部)'
+        required: false
+        default: ''
+      filter_regions:
+        description: '只存哪些區域(留空=全部)'
+        required: false
+        default: ''
+      sleep_sec:
+        description: '每請求間隔秒'
+        required: true
+        default: '0.3'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sitca-data-write
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      segments: ${{ steps.gen.outputs.segments }}
+    steps:
+      - id: gen
+        run: |
+          N=${{ github.event.inputs.parallel }}
+          echo "segments=$(python3 -c "print([i for i in range($N)])")" >> $GITHUB_OUTPUT
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        segment: ${{ fromJson(needs.prepare.outputs.segments) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests
+      - name: 執行建庫(第${{ matrix.segment }}段，新鮮抓，不需既有資料)
+        env:
+          PYTHONUNBUFFERED: '1'
+          SITCA_COMPANIES: ${{ github.event.inputs.companies }}
+          SITCA_DAYS_BACK: ${{ github.event.inputs.days_back }}
+          SITCA_SKIP_RECENT: ${{ github.event.inputs.skip_recent }}
+          SITCA_START: ${{ github.event.inputs.start_date }}
+          SITCA_SLEEP: ${{ github.event.inputs.sleep_sec }}
+          SITCA_TIME_BUDGET: '300'
+          FILTER_COMPANIES: ${{ github.event.inputs.filter_companies }}
+          FILTER_ASSETS: ${{ github.event.inputs.filter_assets }}
+          FILTER_REGIONS: ${{ github.event.inputs.filter_regions }}
+          SEGMENT_TOTAL: ${{ github.event.inputs.parallel }}
+          SEGMENT_INDEX: ${{ matrix.segment }}
+        run: python -u build_sitca.py
+      - name: 上傳本段結果
+        uses: actions/upload-artifact@v4
+        with:
+          name: seg-${{ matrix.segment }}
+          path: data/
+          retention-days: 1
+
+  merge:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: _segs
+      - name: 合併分段檔案
+        run: |
+          mkdir -p data
+          cp -rf _segs/*/* data/ 2>/dev/null || true
+          echo "合併後 data/："; ls -lh data/ | head -40
+      - name: 建庫驗證(缺段/覆蓋/稀疏 → fail，不准上傳)
+        env:
+          SEG_TOTAL: ${{ github.event.inputs.parallel }}
+          MAX_SPAN_DAYS: '25'
+          MIN_COVERAGE: '0.80'
+        run: python3 verify_build.py
+      - name: 上傳 SITCA 全量到 Release(取代舊 seg 檔；不再進 git)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          shopt -s nullglob
+          files=(data/sitca_nav_*.csv data/sitca_progress*.json)
+          [ ${#files[@]} -gt 0 ] || { echo "❌ 沒有 sitca 檔可上傳"; exit 1; }
+          gh release view data-latest >/dev/null 2>&1 || \
+            gh release create data-latest --title "資料庫快照(app 由此讀取)" --notes "自動維護"
+          gh release upload data-latest "${files[@]}" --clobber
+          echo "✅ SITCA 全量(${#files[@]}檔)已上傳 Release"

@@ -1,0 +1,7 @@
+# Allianz Global Investors 品牌主題（依官方色碼規範）
+[theme]
+primaryColor = "#003781"              # Allianz Blue：按鈕、分頁底線、選取、強調
+backgroundColor = "#FFFFFF"           # 白底
+secondaryBackgroundColor = "#DFEFF2"  # Blue 5（極淺藍）：側欄/資訊框/次背景
+textColor = "#122B54"                 # Dark Blue：文字（WCAG 對比達標）
+font = "sans serif"

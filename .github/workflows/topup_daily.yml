@@ -1,0 +1,68 @@
+name: 每日補最新 SITCA 淨值
+
+# 先從 Release 取回現有 sitca 全部檔(含 seg 歷史)+進度，讓 load_progress 知道哪些日期已抓，
+# 只補「庫最新日之後~今天」的新日期到 data/sitca_nav_{年}.csv(非seg)，再上傳該檔+進度到 Release。
+# 不再 commit 進 git(避免 repo 膨脹)。
+
+on:
+  schedule:
+    - cron: '0 13 * * 1-5'   # 週一~五 台北 21:00
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sitca-data-write
+  cancel-in-progress: false
+
+jobs:
+  topup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests
+
+      - name: 從 Release 取回現有 SITCA 檔 + 進度(供 load_progress 判斷已抓日期)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data
+          # 只取 sitca 相關(境內)，境外/績效不需要 → 省時
+          gh release download data-latest -D data --clobber \
+            --pattern 'sitca_nav_*' --pattern 'sitca_progress*' || \
+            echo "⚠️ Release 尚無 sitca 檔(首次)，將從空庫開始"
+          echo "取回檔數："; ls data/ | wc -l
+
+      - name: 補最近幾天(境內全市場)
+        env:
+          PYTHONUNBUFFERED: '1'
+          SITCA_COMPANIES: 'ALL'
+          SITCA_DAYS_BACK: '7'
+          SITCA_SKIP_RECENT: '0'
+          SITCA_SLEEP: '1.5'
+          SEGMENT_TOTAL: '1'        # 單段→寫 sitca_nav_{年}.csv(非seg)
+          SEGMENT_INDEX: '0'
+          SITCA_TIME_BUDGET: '25'
+          SITCA_FAIL_STREAK: '6'
+        run: python -u build_sitca.py
+
+      - name: 上傳補完的年檔 + 進度到 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          shopt -s nullglob
+          # 只上傳「非 seg 的年檔」(topup 寫的)與進度；seg 歷史檔不動
+          files=()
+          for f in data/sitca_nav_[0-9][0-9][0-9][0-9].csv; do files+=("$f"); done
+          for f in data/sitca_progress*.json; do files+=("$f"); done
+          if [ ${#files[@]} -eq 0 ]; then echo "無新檔(假日或今日未公布)"; exit 0; fi
+          gh release view data-latest >/dev/null 2>&1 || \
+            gh release create data-latest --title "資料庫快照(app 由此讀取)" --notes "自動維護"
+          gh release upload data-latest "${files[@]}" --clobber
+          echo "✅ 已上傳 ${#files[@]} 檔(年檔+進度)到 Release"

@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+.streamlit/secrets.toml
+*.csv
+!sample_*.csv
+# ↓↓↓ 資料改由 GitHub Release「data-latest」提供，data/ 不進 git（避免 repo 膨脹→clone 爆）↓↓↓
+# （原本這裡是「!data/ / !data/*.csv 放行 data csv 進 git」，正是害 repo 變肥主因之一，已反轉為擋掉）
+data/
+*.part
