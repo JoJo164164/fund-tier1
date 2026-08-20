@@ -2383,106 +2383,116 @@ def main():
         _icon_title("cmp", "市場狀況（全球行情）")
         st.caption("全球股市指數 + 全球金融 + 商品 + 匯率 + MSCI + 期貨 + 債券，含各列更新時間。"
                    "綠漲紅跌(我們慣例)。多數 live 抓 StockQ、現貨指數抓 yfinance。約5分快取。")
+        if st.button("🔄 載入市場資料", key="load_mkt"):
+            st.session_state["mkt_loaded"] = True
+        if not st.session_state.get("mkt_loaded"):
+            st.info("點上方「載入市場資料」開始抓取（此設計避免開機時一次抓取拖慢啟動）。")
+        else:
 
-        _tabs = _stockq_tables("https://www.stockq.org/")
-        got_any = False
+            _tabs = _stockq_tables("https://www.stockq.org/")
+            got_any = False
 
-        # ── StockQ 首頁多表：關鍵字定位 → 通用卡片(自動辨識欄位+每列時間) ──
-        # spec: (卡片標題, [必含關鍵字])；找不到就跳過(不崩、不假裝)
-        _SPECS = [
-            ("亞洲股市指數", ["日經225", "韓國"]),
-            ("歐洲/非洲股市指數", ["德國股市", "法國股市"]),
-            ("美國股市指數", ["費城半導體", "NASDAQ"]),
-            ("全球金融行情", ["比特幣", "SCFI運價"]),
-            ("金融/地產", ["NYSE金融", "NASDAQ銀行"]),
-            ("羅傑斯/高盛商品", ["CRB指數", "Rogers商品"]),
-            ("商品價格", ["黃金", "白銀"]),
-            ("全球匯率", ["歐元/美元", "美元/日圓"]),
-            ("MSCI 指數", ["世界指數", "新興市場"]),
-            ("全球指數期貨", ["台指期"]),
-            ("債券指數", ["殖利率"]),
-        ]
-        if _tabs:
-            cards = []
-            for title, kws in _SPECS:
-                df = _sq_find(_tabs, *kws)
-                if df is None and len(kws) > 1:       # 放寬：只用首個關鍵字再試一次
-                    df = _sq_find(_tabs, kws[0])
-                if df is not None:
-                    html = _sq_card_from_df(df, title)
-                    if html:
-                        cards.append(html)
-            if cards:
-                got_any = _sq_wall(cards, min_px=310)
-        if not got_any:
-            st.info("StockQ 暫時無法連線或結構調整；以下改用 yfinance 現貨指數。")
+            # ── StockQ 首頁多表：關鍵字定位 → 通用卡片(自動辨識欄位+每列時間) ──
+            # spec: (卡片標題, [必含關鍵字])；找不到就跳過(不崩、不假裝)
+            _SPECS = [
+                ("亞洲股市指數", ["日經225", "韓國"]),
+                ("歐洲/非洲股市指數", ["德國股市", "法國股市"]),
+                ("美國股市指數", ["費城半導體", "NASDAQ"]),
+                ("全球金融行情", ["比特幣", "SCFI運價"]),
+                ("金融/地產", ["NYSE金融", "NASDAQ銀行"]),
+                ("羅傑斯/高盛商品", ["CRB指數", "Rogers商品"]),
+                ("商品價格", ["黃金", "白銀"]),
+                ("全球匯率", ["歐元/美元", "美元/日圓"]),
+                ("MSCI 指數", ["世界指數", "新興市場"]),
+                ("全球指數期貨", ["台指期"]),
+                ("債券指數", ["殖利率"]),
+            ]
+            if _tabs:
+                cards = []
+                for title, kws in _SPECS:
+                    df = _sq_find(_tabs, *kws)
+                    if df is None and len(kws) > 1:       # 放寬：只用首個關鍵字再試一次
+                        df = _sq_find(_tabs, kws[0])
+                    if df is not None:
+                        html = _sq_card_from_df(df, title)
+                        if html:
+                            cards.append(html)
+                if cards:
+                    got_any = _sq_wall(cards, min_px=310)
+            if not got_any:
+                st.info("StockQ 暫時無法連線或結構調整；以下改用 yfinance 現貨指數。")
 
-        # ── 自有資料：yfinance 現貨指數（同款卡片；StockQ 掛掉時的後備、平時當我方對照）──
-        spot = load_spot_indices()
-        if spot:
-            st.markdown("###### 現貨指數（yfinance · 我方對照）")
-            spot_cards = []
-            for region, lst in _INDEX_MAP.items():
-                items = []
-                for nm, _t in lst:
-                    if nm in spot:
-                        p, c, pct = spot[nm]
-                        items.append((nm, "{:,.2f}".format(p), pct, c))
-                if items:
-                    spot_cards.append(_quote_card_html(region + "股市指數", items,
-                                                        price_hdr="現價"))
-            _sq_wall(spot_cards, min_px=280)
-        elif not got_any:
-            st.warning("yfinance 現貨指數也抓取失敗；請確認 requirements.txt 含 yfinance、稍後再試。")
+            # ── 自有資料：yfinance 現貨指數（同款卡片；StockQ 掛掉時的後備、平時當我方對照）──
+            spot = load_spot_indices()
+            if spot:
+                st.markdown("###### 現貨指數（yfinance · 我方對照）")
+                spot_cards = []
+                for region, lst in _INDEX_MAP.items():
+                    items = []
+                    for nm, _t in lst:
+                        if nm in spot:
+                            p, c, pct = spot[nm]
+                            items.append((nm, "{:,.2f}".format(p), pct, c))
+                    if items:
+                        spot_cards.append(_quote_card_html(region + "股市指數", items,
+                                                            price_hdr="現價"))
+                _sq_wall(spot_cards, min_px=280)
+            elif not got_any:
+                st.warning("yfinance 現貨指數也抓取失敗；請確認 requirements.txt 含 yfinance、稍後再試。")
 
-        st.caption("來源：StockQ（各表右上為該表更新時間）＋ yfinance 現貨。列印 Ctrl+P。")
+            st.caption("來源：StockQ（各表右上為該表更新時間）＋ yfinance 現貨。列印 Ctrl+P。")
 
     # ══ 📊 漲跌排行（StockQ /market/：所有期間一次展開，上漲下跌兩牆）══
     with tab_movers:
         _icon_title("scan", "漲跌排行（StockQ 全球股市）")
         st.caption("各期間表現最好/最差的股市，所有期間一次展開。綠漲紅跌(我們慣例)。"
                    "live 抓 StockQ、約5分快取。")
-        _mt = _stockq_tables("https://www.stockq.org/market/")
-        if not _mt:
-            st.warning("暫時無法連線 StockQ（或該站結構調整）。稍後再試。")
+        if st.button("🔄 載入漲跌排行", key="load_mv"):
+            st.session_state["mv_loaded"] = True
+        if not st.session_state.get("mv_loaded"):
+            st.info("點上方「載入漲跌排行」開始抓取（此設計避免開機時一次抓取拖慢啟動）。")
         else:
-            try:
-                # 收集 2 欄(股市, 漲跌幅%) 的排行表；前半＝各期間漲、後半＝各期間跌
-                movers = []
-                for t in _mt:
-                    if t.shape[1] == 2 and len(t) >= 4:
-                        c = t.copy()
-                        c.columns = ["股市", "漲跌幅"]
-                        c["漲跌幅%"] = c["漲跌幅"].map(_sq_pct_to_num)
-                        c = c[c["漲跌幅%"].notna()]
-                        if len(c) >= 4 and c["股市"].astype(str).str.contains("%").sum() == 0:
-                            movers.append(c[["股市", "漲跌幅%"]].reset_index(drop=True))
-                if not movers:
-                    st.warning("StockQ 排行結構可能調整，暫時解析不到。跟我說我修解析。")
-                else:
-                    _periods = ["一日", "一週", "兩週", "本月以來", "一個月", "兩個月",
-                                "三個月", "六個月", "今年以來", "一年", "從今年高點", "從今年低點"]
-                    half = len(movers) // 2
+            _mt = _stockq_tables("https://www.stockq.org/market/")
+            if not _mt:
+                st.warning("暫時無法連線 StockQ（或該站結構調整）。稍後再試。")
+            else:
+                try:
+                    # 收集 2 欄(股市, 漲跌幅%) 的排行表；前半＝各期間漲、後半＝各期間跌
+                    movers = []
+                    for t in _mt:
+                        if t.shape[1] == 2 and len(t) >= 4:
+                            c = t.copy()
+                            c.columns = ["股市", "漲跌幅"]
+                            c["漲跌幅%"] = c["漲跌幅"].map(_sq_pct_to_num)
+                            c = c[c["漲跌幅%"].notna()]
+                            if len(c) >= 4 and c["股市"].astype(str).str.contains("%").sum() == 0:
+                                movers.append(c[["股市", "漲跌幅%"]].reset_index(drop=True))
+                    if not movers:
+                        st.warning("StockQ 排行結構可能調整，暫時解析不到。跟我說我修解析。")
+                    else:
+                        _periods = ["一日", "一週", "兩週", "本月以來", "一個月", "兩個月",
+                                    "三個月", "六個月", "今年以來", "一年", "從今年高點", "從今年低點"]
+                        half = len(movers) // 2
 
-                    def _label(i):
-                        return _periods[i] if i < len(_periods) else "期間{}".format(i + 1)
+                        def _label(i):
+                            return _periods[i] if i < len(_periods) else "期間{}".format(i + 1)
 
-                    # 上牆：各期間「漲最多」
-                    st.markdown("#### 📈 各期間表現最好")
-                    up_cards = [_sq_rank_card_html(_label(i), list(zip(
-                        movers[i]["股市"].astype(str), movers[i]["漲跌幅%"])))
-                        for i in range(half)]
-                    _sq_wall(up_cards, min_px=190)
+                        # 上牆：各期間「漲最多」
+                        st.markdown("#### 📈 各期間表現最好")
+                        up_cards = [_sq_rank_card_html(_label(i), list(zip(
+                            movers[i]["股市"].astype(str), movers[i]["漲跌幅%"])))
+                            for i in range(half)]
+                        _sq_wall(up_cards, min_px=190)
 
-                    # 下牆：各期間「跌最多」
-                    st.markdown("#### 📉 各期間表現最差")
-                    dn_cards = [_sq_rank_card_html(_label(i), list(zip(
-                        movers[half + i]["股市"].astype(str), movers[half + i]["漲跌幅%"])))
-                        for i in range(half) if half + i < len(movers)]
-                    _sq_wall(dn_cards, min_px=190)
-            except Exception:
-                st.warning("StockQ 排行解析失敗（結構可能已調整）。把 /market/ 頁 HTML 貼我，我修解析。")
-            st.caption("來源 StockQ /market/。列印 Ctrl+P。")
+                        # 下牆：各期間「跌最多」
+                        st.markdown("#### 📉 各期間表現最差")
+                        dn_cards = [_sq_rank_card_html(_label(i), list(zip(
+                            movers[half + i]["股市"].astype(str), movers[half + i]["漲跌幅%"])))
+                            for i in range(half) if half + i < len(movers)]
+                        _sq_wall(dn_cards, min_px=190)
+                except Exception:
+                    st.warning("StockQ 排行解析失敗（結構可能已調整）。把 /market/ 頁 HTML 貼我，我修解析。")
+                st.caption("來源 StockQ /market/。列印 Ctrl+P。")
 
     # ══ 筆記（手動、可下載保存；取代自動追蹤日誌）══
     with tab_notes:
