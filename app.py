@@ -984,9 +984,9 @@ def _sq_wall(card_htmls, min_px=300):
 
 # ── 全球現貨指數（yfinance，我們技術棧已用）：亞洲/歐洲/美洲 ──
 _INDEX_MAP = {
-    "亞洲": [("台灣加權", "^TWII"), ("日經225", "^N225"), ("東證TOPIX", "^TPX"),
+    "亞洲": [("台灣加權", "^TWII"), ("日經225", "^N225"),
              ("韓國KOSPI", "^KS11"), ("上海綜合", "000001.SS"), ("深證成指", "399001.SZ"),
-             ("滬深300", "000300.SS"), ("香港恆生", "^HSI"), ("恆生科技", "^HSTECH"),
+             ("滬深300", "000300.SS"), ("香港恆生", "^HSI"),
              ("新加坡", "^STI"), ("印度SENSEX", "^BSESN"), ("印尼", "^JKSE"),
              ("馬來西亞", "^KLSE"), ("泰國SET", "^SET.BK"), ("澳洲200", "^AXJO")],
     "歐洲": [("英國FTSE", "^FTSE"), ("德國DAX", "^GDAXI"), ("法國CAC", "^FCHI"),
@@ -997,22 +997,42 @@ _INDEX_MAP = {
              ("加拿大", "^GSPTSE"), ("巴西", "^BVSP"), ("墨西哥", "^MXX")],
 }
 
+# yfinance 補：StockQ 的匯率/期貨/加密即時價是 JS 動態、靜態抓不到 → 改用 yfinance
+_QUOTE_MAP = {
+    "全球匯率": [("歐元/美元", "EURUSD=X"), ("英鎊/美元", "GBPUSD=X"),
+                 ("美元/日圓", "USDJPY=X"), ("美元/台幣", "USDTWD=X"),
+                 ("澳幣/美元", "AUDUSD=X"), ("美元/人民幣", "USDCNY=X"),
+                 ("美元/港幣", "USDHKD=X"), ("美元/韓元", "USDKRW=X")],
+    "指數期貨": [("道瓊期", "YM=F"), ("S&P500期", "ES=F"), ("NASDAQ100期", "NQ=F"),
+                 ("羅素2000期", "RTY=F"), ("日經期", "NKD=F")],
+    "加密/波動": [("比特幣", "BTC-USD"), ("以太幣", "ETH-USD"),
+                   ("VIX恐慌", "^VIX"), ("黃金期", "GC=F"), ("紐約原油", "CL=F")],
+}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _market_fetch_time():
+    """市場資料抓取時間(台北)。ttl 與資料同步(300s)→回的是本次快取建立時間。"""
+    return dt.datetime.utcnow() + dt.timedelta(hours=8)
+
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_spot_indices():
-    """yfinance 抓全球現貨指數現價+漲跌%。回 {name:(price,chg,pct)}。"""
+    """yfinance 抓全球指數/匯率/期貨/加密 現價+漲跌%。回 {name:(price,chg,pct)}。"""
     try:
         import yfinance as yf
     except Exception:
         return {}
-    tickers = [t for g in _INDEX_MAP.values() for _, t in g]
+    _allmaps = list(_INDEX_MAP.values()) + list(_QUOTE_MAP.values())
+    tickers = [t for g in _allmaps for _, t in g]
     out = {}
     try:
         data = yf.download(tickers, period="5d", interval="1d",
                            group_by="ticker", progress=False, threads=True)
     except Exception:
         return {}
-    name_by_t = {t: n for g in _INDEX_MAP.values() for n, t in g}
+    name_by_t = {t: n for g in (list(_INDEX_MAP.values()) + list(_QUOTE_MAP.values()))
+                 for n, t in g}
     for t in tickers:
         try:
             col = data[t]["Close"].dropna()
@@ -2465,64 +2485,67 @@ def main():
             st.caption("報酬為官方數字(MoneyDJ,考慮配息)。發行公司/系列以基金名對應官方分類，"
                        "對不到者不顯示該欄。風險指標(標準差/Sharpe)因境內來源未提供，改於個別分析呈現。")
 
-    # ══ 🌍 市場狀況（StockQ 全站多表 → 卡片牆；yfinance 現貨當自有補充/後備）══
+    # ══ 🌍 市場狀況（StockQ wide.php 商品/MSCI/債券 + yfinance 指數/匯率/期貨/加密）══
+    #   ★真相：StockQ 的指數/匯率/期貨即時價是 JS 動態，read_html 抓到空 →
+    #     只有商品/MSCI/債券在靜態 HTML 有真值 → 那三個抓 StockQ，其餘用 yfinance。
     with tab_mkt:
         _icon_title("cmp", "市場狀況（全球行情）")
-        st.caption("全球股市指數 + 全球金融 + 商品 + 匯率 + MSCI + 期貨 + 債券，含各列更新時間。"
-                   "綠漲紅跌(我們慣例)。多數 live 抓 StockQ、現貨指數抓 yfinance。約5分快取。")
+        _mft = _market_fetch_time()
+        st.markdown(
+            '<div style="background:#DFEFF2;border:1px solid #B5DAE6;border-radius:8px;'
+            'padding:6px 12px;margin:2px 0 8px;font-size:.85rem;color:#003781">'
+            '🕒 <b>資料抓取時間</b>：{} （台北）　·　約每 5 分鐘更新　·　'
+            '綠漲紅跌(我們慣例)</div>'.format(_mft.strftime("%Y-%m-%d %H:%M")),
+            unsafe_allow_html=True)
+        st.caption("商品／MSCI／債券 抓 StockQ（各表右上為該表時間）；指數／匯率／期貨／加密 抓 yfinance。")
 
-        _tabs = _stockq_tables("https://www.stockq.org/")
-        got_any = False
-
-        # ── StockQ 首頁多表：關鍵字定位 → 通用卡片(自動辨識欄位+每列時間) ──
-        # spec: (卡片標題, [必含關鍵字])；找不到就跳過(不崩、不假裝)
+        # ── StockQ wide.php：只取「靜態有真值」的商品/MSCI/債券 ──
+        _tabs = _stockq_tables("https://www.stockq.org/wide.php")
         _SPECS = [
-            ("亞洲股市指數", ["日經225", "韓國"]),
-            ("歐洲/非洲股市指數", ["德國股市", "法國股市"]),
-            ("美國股市指數", ["費城半導體", "NASDAQ"]),
-            ("全球金融行情", ["比特幣", "SCFI運價"]),
-            ("金融/地產", ["NYSE金融", "NASDAQ銀行"]),
-            ("羅傑斯/高盛商品", ["CRB指數", "Rogers商品"]),
-            ("商品價格", ["黃金", "白銀"]),
-            ("全球匯率", ["歐元/美元", "美元/日圓"]),
-            ("MSCI 指數", ["世界指數", "新興市場"]),
-            ("全球指數期貨", ["台指期"]),
-            ("債券指數", ["殖利率"]),
+            ("商品價格（貴金屬/基本金屬/能源）", ["黃金", "銅"]),
+            ("MSCI 指數（單日/本月/今年）", ["世界指數", "新興市場"]),
+            ("債券指數（殖利率/利差）", ["ICE全球高收益", "AA等級債"]),
         ]
         if _tabs:
             cards = []
             for title, kws in _SPECS:
                 df = _sq_find(_tabs, *kws)
-                if df is None and len(kws) > 1:       # 放寬：只用首個關鍵字再試一次
+                if df is None and len(kws) > 1:
                     df = _sq_find(_tabs, kws[0])
                 if df is not None:
-                    html = _sq_card_from_df(df, title)
+                    html = _sq_card_from_df(df, title, max_rows=120)
                     if html:
                         cards.append(html)
             if cards:
-                got_any = _sq_wall(cards, min_px=310)
-        if not got_any:
-            st.info("StockQ 暫時無法連線或結構調整；以下改用 yfinance 現貨指數。")
+                _sq_wall(cards, min_px=330)
+            else:
+                st.info("StockQ 商品/MSCI/債券 暫時解析不到（結構或連線）。")
+        else:
+            st.info("StockQ 暫時無法連線。")
 
-        # ── 自有資料：yfinance 現貨指數（同款卡片；StockQ 掛掉時的後備、平時當我方對照）──
+        # ── yfinance：指數(亞/歐/美) + 匯率 + 期貨 + 加密/波動 ──
         spot = load_spot_indices()
         if spot:
-            st.markdown("###### 現貨指數（yfinance · 我方對照）")
-            spot_cards = []
-            for region, lst in _INDEX_MAP.items():
-                items = []
-                for nm, _t in lst:
-                    if nm in spot:
-                        p, c, pct = spot[nm]
-                        items.append((nm, "{:,.2f}".format(p), pct, c))
-                if items:
-                    spot_cards.append(_quote_card_html(region + "股市指數", items,
-                                                        price_hdr="現價"))
-            _sq_wall(spot_cards, min_px=280)
-        elif not got_any:
-            st.warning("yfinance 現貨指數也抓取失敗；請確認 requirements.txt 含 yfinance、稍後再試。")
+            def _mk_cards(mapping, suffix=""):
+                cs = []
+                for grp, lst in mapping.items():
+                    items = []
+                    for nm, _t in lst:
+                        if nm in spot:
+                            p, c, pct = spot[nm]
+                            fmt = "{:,.4f}" if abs(p) < 100 else "{:,.2f}"
+                            items.append((nm, fmt.format(p), pct, c))
+                    if items:
+                        cs.append(_quote_card_html(grp + suffix, items, price_hdr="現價"))
+                return cs
+            st.markdown("###### 全球指數（yfinance）")
+            _sq_wall(_mk_cards(_INDEX_MAP, "股市指數"), min_px=280)
+            st.markdown("###### 匯率 · 期貨 · 加密/波動（yfinance）")
+            _sq_wall(_mk_cards(_QUOTE_MAP), min_px=260)
+        else:
+            st.warning("yfinance 現貨抓取失敗；請確認 requirements.txt 含 yfinance、稍後再試。")
 
-        st.caption("來源：StockQ（各表右上為該表更新時間）＋ yfinance 現貨。列印 Ctrl+P。")
+        st.caption("來源：StockQ wide.php（商品/MSCI/債券）＋ yfinance（指數/匯率/期貨/加密）。列印 Ctrl+P。")
 
     # ══ 📊 漲跌排行（StockQ /market/：所有期間一次展開，上漲下跌兩牆）══
     with tab_movers:
