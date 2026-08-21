@@ -998,15 +998,13 @@ _INDEX_MAP = {
 }
 
 # yfinance 補：StockQ 的匯率/期貨/加密即時價是 JS 動態、靜態抓不到 → 改用 yfinance
+# ★精簡為主流可靠代碼(冷門代碼會限流重試→拖垮開機健康檢查)★
 _QUOTE_MAP = {
     "全球匯率": [("歐元/美元", "EURUSD=X"), ("英鎊/美元", "GBPUSD=X"),
                  ("美元/日圓", "USDJPY=X"), ("美元/台幣", "USDTWD=X"),
-                 ("澳幣/美元", "AUDUSD=X"), ("美元/人民幣", "USDCNY=X"),
-                 ("美元/港幣", "USDHKD=X"), ("美元/韓元", "USDKRW=X")],
-    "指數期貨": [("道瓊期", "YM=F"), ("S&P500期", "ES=F"), ("NASDAQ100期", "NQ=F"),
-                 ("羅素2000期", "RTY=F"), ("日經期", "NKD=F")],
-    "加密/波動": [("比特幣", "BTC-USD"), ("以太幣", "ETH-USD"),
-                   ("VIX恐慌", "^VIX"), ("黃金期", "GC=F"), ("紐約原油", "CL=F")],
+                 ("美元/人民幣", "USDCNY=X")],
+    "指數期貨": [("道瓊期", "YM=F"), ("S&P500期", "ES=F"), ("NASDAQ100期", "NQ=F")],
+    "加密/波動": [("比特幣", "BTC-USD"), ("VIX恐慌", "^VIX")],
 }
 
 
@@ -1018,21 +1016,33 @@ def _market_fetch_time():
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_spot_indices():
-    """yfinance 抓全球指數/匯率/期貨/加密 現價+漲跌%。回 {name:(price,chg,pct)}。"""
+    """yfinance 抓全球指數/匯率/期貨/加密 現價+漲跌%。回 {name:(price,chg,pct)}。
+    ★開機保護：下載放背景執行緒、最多等 20 秒；逾時就放棄回空，避免 yfinance 限流
+      重試卡住主執行緒 → Streamlit 健康檢查(healthz)逾時 → 部署被判不健康。"""
     try:
         import yfinance as yf
     except Exception:
         return {}
+    import threading
     _allmaps = list(_INDEX_MAP.values()) + list(_QUOTE_MAP.values())
     tickers = [t for g in _allmaps for _, t in g]
+    name_by_t = {t: n for g in _allmaps for n, t in g}
+    holder = {}
+
+    def _worker():
+        try:
+            holder["data"] = yf.download(tickers, period="5d", interval="1d",
+                                         group_by="ticker", progress=False, threads=True)
+        except Exception:
+            holder["data"] = None
+
+    th = threading.Thread(target=_worker, daemon=True)
+    th.start()
+    th.join(timeout=20)          # 最多等 20 秒
+    data = holder.get("data")
+    if data is None:
+        return {}                # 逾時或失敗 → 放棄(下次快取到期再試)，不拖垮開機
     out = {}
-    try:
-        data = yf.download(tickers, period="5d", interval="1d",
-                           group_by="ticker", progress=False, threads=True)
-    except Exception:
-        return {}
-    name_by_t = {t: n for g in (list(_INDEX_MAP.values()) + list(_QUOTE_MAP.values()))
-                 for n, t in g}
     for t in tickers:
         try:
             col = data[t]["Close"].dropna()
