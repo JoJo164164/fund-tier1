@@ -1037,6 +1037,73 @@ def load_msci_stockq():
     return _stockq_tables("https://www.stockq.org/market/msci.php")
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_cnyes_detail(name, code):
+    """抓 cnyes 基金明細頁『績效表現』表(晨星資料，SSR 靜態可解析)。
+    回 dict：{found, url, update, periods:[..], rows:{標籤:{期間:值}}}。失敗回 {found:False}。
+    標籤含：基金績效 / 基準指數 / 同組平均 / 同組排名 / 贏過N%基金（比 MoneyDJ 完整）。"""
+    import requests
+    import urllib.parse
+    out = {"found": False}
+    try:
+        url = "https://fund.cnyes.com/detail/{}/{}".format(
+            urllib.parse.quote(str(name)), str(code))
+        r = requests.get(url, headers=_SQ_HEADERS, timeout=20)
+        r.encoding = "utf-8"
+        html = r.text
+        tables = pd.read_html(io.StringIO(html))
+    except Exception:
+        return out
+    # 更新日期（在表格外文字，regex 撈）
+    upd = ""
+    try:
+        m = _sqre.search(r"更新日期[:：]\s*(\d{4}/\d{1,2}/\d{1,2})", html)
+        if m:
+            upd = m.group(1)
+    except Exception:
+        upd = ""
+    for t in tables:
+        try:
+            if t.shape[1] < 3:
+                continue
+            first = t.iloc[:, 0].astype(str)
+            if first.str.contains("基金績效").any() and first.str.contains("同組平均").any():
+                t = t.copy()
+                cols = [str(c) for c in t.columns]
+                # 期間欄：欄名本身是期間名就用欄名；否則第一列是期間名就用第一列
+                def _isp(x):
+                    return ("月" in x) or ("今" in x) or ("年" in x)
+                if any(_isp(c) for c in cols[1:]):
+                    periods = cols[1:]
+                    body = t
+                else:
+                    firstrow = [str(x) for x in t.iloc[0].tolist()]
+                    if any(_isp(x) for x in firstrow[1:]):
+                        periods = firstrow[1:]
+                        body = t.iloc[1:]
+                    else:
+                        periods = cols[1:]
+                        body = t
+                rows = {}
+                for _, r0 in body.iterrows():
+                    label = str(r0.iloc[0]).strip()
+                    if not label or label.lower() == "nan" or _isp(label):
+                        continue
+                    vals = {}
+                    for i, p in enumerate(periods):
+                        if i + 1 < len(r0):
+                            v = str(r0.iloc[i + 1]).strip()
+                            vals[p] = "" if v.lower() == "nan" else v
+                    rows[label] = vals
+                if rows:
+                    out = {"found": True, "url": url, "update": upd,
+                           "periods": periods, "rows": rows}
+                break
+        except Exception:
+            continue
+    return out
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_spot_indices():
     """yfinance 抓全球指數/匯率/期貨/加密 現價+漲跌%。回 {name:(price,chg,pct)}。
@@ -2207,6 +2274,40 @@ def main():
                                        + ("" if _has_risk else "此檔為境內基金，來源未提供風險指標。"))
                         else:
                             st.info("此檔在 MoneyDJ 無對應官方績效（可能名稱/類股差異）。滾動跌幅與回測分析不受影響，見下方。")
+
+                        # 🐝 cnyes 晨星明細（基金績效/基準指數/同組平均/贏過N%，比 MoneyDJ 完整）
+                        _cd = load_cnyes_detail(_pname, code_a)
+                        _icon_title("cmp", "cnyes 明細（晨星）")
+                        if _cd.get("found"):
+                            _periods_c = _cd["periods"]
+                            _rows_c = _cd["rows"]
+                            # (1) 績效矩陣：基金/基準/同組平均 → 數值+綠漲紅跌
+                            _mat_labels = [x for x in ["基金績效", "基準指數", "同組平均"]
+                                           if x in _rows_c]
+                            if _mat_labels:
+                                _mat = {}
+                                for lab in _mat_labels:
+                                    _mat[lab] = {p: _sq_num(_rows_c[lab].get(p, ""))
+                                                 for p in _periods_c}
+                                _mdf = pd.DataFrame(_mat).T[_periods_c]
+                                st.dataframe(
+                                    _mdf.style.apply(_heat_neg(-30), subset=_periods_c)
+                                    .format("{:.2f}%", na_rep="—"),
+                                    use_container_width=True)
+                            # (2) 贏過N%基金 / 同組排名 → 另列(百分位，越高越好)
+                            for lab in ["贏過N%基金", "同組排名"]:
+                                if lab in _rows_c:
+                                    vals = _rows_c[lab]
+                                    line = "　".join(
+                                        "{}：{}".format(p, vals.get(p) or "—")
+                                        for p in _periods_c if vals.get(p))
+                                    if line.strip():
+                                        st.markdown("**{}**　{}".format(lab, line))
+                            st.caption("來源 cnyes（Powered by 晨星）{}。基金績效vs基準/同組平均，"
+                                       "負報酬標紅。".format(
+                                           "，更新日 " + _cd["update"] if _cd.get("update") else ""))
+                        else:
+                            st.info("cnyes 無此檔明細（代碼與 cnyes 不一致，或未收錄）。不影響其他分析。")
                         st.markdown("---")
 
                         win_df, avg_df, dd_df = mp.build_summary_tables(prices)
