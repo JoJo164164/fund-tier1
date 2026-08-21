@@ -982,29 +982,46 @@ def _sq_wall(card_htmls, min_px=300):
     return True
 
 
-# ── 全球現貨指數（yfinance，我們技術棧已用）：亞洲/歐洲/美洲 ──
+# ══════════════════════════════════════════════════════════════
+# 市場行情資料源對照（Plan A：yfinance 為主力大幅擴充 + MSCI 抓 StockQ）
+#   StockQ 的指數/匯率/期貨/全球金融「即時價」是 JS 動態、靜態 read_html 抓到空，
+#   故改用 yfinance(有真值)；MSCI 靜態有真值 → 抓 StockQ msci.php。
+#   完整度/對照/缺漏見交付的「市場資料源對照與完整度評估.md」。
+# ══════════════════════════════════════════════════════════════
 _INDEX_MAP = {
-    "亞洲": [("台灣加權", "^TWII"), ("日經225", "^N225"),
-             ("韓國KOSPI", "^KS11"), ("上海綜合", "000001.SS"), ("深證成指", "399001.SZ"),
-             ("滬深300", "000300.SS"), ("香港恆生", "^HSI"),
-             ("新加坡", "^STI"), ("印度SENSEX", "^BSESN"), ("印尼", "^JKSE"),
-             ("馬來西亞", "^KLSE"), ("泰國SET", "^SET.BK"), ("澳洲200", "^AXJO")],
-    "歐洲": [("英國FTSE", "^FTSE"), ("德國DAX", "^GDAXI"), ("法國CAC", "^FCHI"),
+    "亞洲": [("台灣加權", "^TWII"), ("日經225", "^N225"), ("韓國KOSPI", "^KS11"),
+             ("上海綜合", "000001.SS"), ("深證成指", "399001.SZ"), ("滬深300", "000300.SS"),
+             ("創業板", "399006.SZ"), ("香港恆生", "^HSI"), ("新加坡海峽", "^STI"),
+             ("印度SENSEX", "^BSESN"), ("印度NIFTY", "^NSEI"), ("印尼JKSE", "^JKSE"),
+             ("馬來西亞", "^KLSE"), ("泰國SET", "^SET.BK"), ("澳洲200", "^AXJO"),
+             ("澳洲普通", "^AORD"), ("紐西蘭50", "^NZ50")],
+    "歐洲/非洲": [("英國FTSE", "^FTSE"), ("德國DAX", "^GDAXI"), ("法國CAC", "^FCHI"),
              ("歐洲Stoxx50", "^STOXX50E"), ("西班牙IBEX", "^IBEX"),
-             ("義大利FTSEMIB", "FTSEMIB.MI"), ("荷蘭AEX", "^AEX"), ("瑞士SMI", "^SSMI")],
+             ("義大利FTSEMIB", "FTSEMIB.MI"), ("荷蘭AEX", "^AEX"), ("瑞士SMI", "^SSMI"),
+             ("比利時BEL20", "^BFX"), ("土耳其XU100", "XU100.IS")],
     "美洲": [("道瓊工業", "^DJI"), ("S&P 500", "^GSPC"), ("NASDAQ", "^IXIC"),
              ("NASDAQ100", "^NDX"), ("費城半導體", "^SOX"), ("羅素2000", "^RUT"),
-             ("加拿大", "^GSPTSE"), ("巴西", "^BVSP"), ("墨西哥", "^MXX")],
+             ("NYSE綜合", "^NYA"), ("加拿大TSX", "^GSPTSE"), ("巴西", "^BVSP"),
+             ("墨西哥", "^MXX")],
 }
 
-# yfinance 補：StockQ 的匯率/期貨/加密即時價是 JS 動態、靜態抓不到 → 改用 yfinance
-# ★精簡為主流可靠代碼(冷門代碼會限流重試→拖垮開機健康檢查)★
 _QUOTE_MAP = {
-    "全球匯率": [("歐元/美元", "EURUSD=X"), ("英鎊/美元", "GBPUSD=X"),
-                 ("美元/日圓", "USDJPY=X"), ("美元/台幣", "USDTWD=X"),
-                 ("美元/人民幣", "USDCNY=X")],
-    "指數期貨": [("道瓊期", "YM=F"), ("S&P500期", "ES=F"), ("NASDAQ100期", "NQ=F")],
-    "加密/波動": [("比特幣", "BTC-USD"), ("VIX恐慌", "^VIX")],
+    "全球匯率": [("美元指數", "DX-Y.NYB"), ("歐元/美元", "EURUSD=X"), ("英鎊/美元", "GBPUSD=X"),
+                 ("美元/日圓", "USDJPY=X"), ("美元/台幣", "USDTWD=X"), ("美元/人民幣", "USDCNY=X"),
+                 ("美元/港幣", "USDHKD=X"), ("澳幣/美元", "AUDUSD=X"), ("紐幣/美元", "NZDUSD=X"),
+                 ("美元/加幣", "USDCAD=X"), ("美元/新元", "USDSGD=X"), ("美元/韓元", "USDKRW=X"),
+                 ("美元/印度盧比", "USDINR=X"), ("歐元/日圓", "EURJPY=X"), ("英鎊/日圓", "GBPJPY=X"),
+                 ("歐元/英鎊", "EURGBP=X")],
+    "商品原物料": [("黃金", "GC=F"), ("白銀", "SI=F"), ("銅", "HG=F"), ("白金", "PL=F"),
+                   ("鈀", "PA=F"), ("紐約原油", "CL=F"), ("布蘭特原油", "BZ=F"),
+                   ("天然氣", "NG=F"), ("汽油", "RB=F"), ("玉米", "ZC=F"), ("黃豆", "ZS=F"),
+                   ("小麥", "ZW=F"), ("咖啡", "KC=F"), ("糖", "SB=F"), ("棉花", "CT=F")],
+    "指數期貨": [("道瓊期", "YM=F"), ("S&P500期", "ES=F"), ("NASDAQ100期", "NQ=F"),
+                 ("羅素2000期", "RTY=F"), ("日經期", "NKD=F")],
+    "加密/波動": [("比特幣", "BTC-USD"), ("以太幣", "ETH-USD"),
+                   ("VIX恐慌", "^VIX"), ("VXN納指波動", "^VXN")],
+    "美公債殖利率": [("13週利率", "^IRX"), ("5年利率", "^FVX"),
+                     ("10年利率", "^TNX"), ("30年利率", "^TYX")],
 }
 
 
@@ -1012,6 +1029,12 @@ _QUOTE_MAP = {
 def _market_fetch_time():
     """市場資料抓取時間(台北)。ttl 與資料同步(300s)→回的是本次快取建立時間。"""
     return dt.datetime.utcnow() + dt.timedelta(hours=8)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_msci_stockq():
+    """抓 StockQ msci.php 靜態 MSCI 表(有真值)。回 list[DataFrame]。失敗回 []。"""
+    return _stockq_tables("https://www.stockq.org/market/msci.php")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -1038,7 +1061,7 @@ def load_spot_indices():
 
     th = threading.Thread(target=_worker, daemon=True)
     th.start()
-    th.join(timeout=20)          # 最多等 20 秒
+    th.join(timeout=35)          # 分頁載入(非開機)→可等久些，涵蓋更多標的
     data = holder.get("data")
     if data is None:
         return {}                # 逾時或失敗 → 放棄(下次快取到期再試)，不拖垮開機
@@ -2495,47 +2518,29 @@ def main():
             st.caption("報酬為官方數字(MoneyDJ,考慮配息)。發行公司/系列以基金名對應官方分類，"
                        "對不到者不顯示該欄。風險指標(標準差/Sharpe)因境內來源未提供，改於個別分析呈現。")
 
-    # ══ 🌍 市場狀況（StockQ wide.php 商品/MSCI/債券 + yfinance 指數/匯率/期貨/加密）══
-    #   ★真相：StockQ 的指數/匯率/期貨即時價是 JS 動態，read_html 抓到空 →
-    #     只有商品/MSCI/債券在靜態 HTML 有真值 → 那三個抓 StockQ，其餘用 yfinance。
+    # ══ 🌍 市場狀況（yfinance 指數/匯率/商品/期貨/加密/殖利率 + StockQ MSCI）══
+    #   ★真相：StockQ 指數/匯率/期貨即時價是 JS 動態 read_html 抓到空 → 全改 yfinance；
+    #     MSCI 靜態有真值 → 抓 StockQ msci.php。★分頁載入(非開機)避免 healthz。
     with tab_mkt:
         _icon_title("cmp", "市場狀況（全球行情）")
+        # 頂部固定顯示截止時間（跟資料成敗脫鉤，一定出現）
         _mft = _market_fetch_time()
         st.markdown(
-            '<div style="background:#DFEFF2;border:1px solid #B5DAE6;border-radius:8px;'
-            'padding:6px 12px;margin:2px 0 8px;font-size:.85rem;color:#003781">'
-            '🕒 <b>資料抓取時間</b>：{} （台北）　·　約每 5 分鐘更新　·　'
-            '綠漲紅跌(我們慣例)</div>'.format(_mft.strftime("%Y-%m-%d %H:%M")),
+            '<div style="background:#003781;color:#fff;border-radius:8px;'
+            'padding:8px 14px;margin:2px 0 6px;font-size:.9rem;font-weight:600">'
+            '🕒 資料截至：{} （台北）　·　指數/匯率/商品/期貨/加密 來源 yfinance、'
+            'MSCI 來源 StockQ　·　約每 5 分鐘更新　·　綠漲紅跌</div>'.format(
+                _mft.strftime("%Y-%m-%d %H:%M")),
             unsafe_allow_html=True)
-        st.caption("商品／MSCI／債券 抓 StockQ（各表右上為該表時間）；指數／匯率／期貨／加密 抓 yfinance。")
 
-        # ── StockQ wide.php：只取「靜態有真值」的商品/MSCI/債券 ──
-        _tabs = _stockq_tables("https://www.stockq.org/wide.php")
-        _SPECS = [
-            ("商品價格（貴金屬/基本金屬/能源）", ["黃金", "銅"]),
-            ("MSCI 指數（單日/本月/今年）", ["世界指數", "新興市場"]),
-            ("債券指數（殖利率/利差）", ["ICE全球高收益", "AA等級債"]),
-        ]
-        if _tabs:
-            cards = []
-            for title, kws in _SPECS:
-                df = _sq_find(_tabs, *kws)
-                if df is None and len(kws) > 1:
-                    df = _sq_find(_tabs, kws[0])
-                if df is not None:
-                    html = _sq_card_from_df(df, title, max_rows=120)
-                    if html:
-                        cards.append(html)
-            if cards:
-                _sq_wall(cards, min_px=330)
-            else:
-                st.info("StockQ 商品/MSCI/債券 暫時解析不到（結構或連線）。")
+        if st.button("🔄 載入 / 重新整理市場資料", key="load_mkt"):
+            st.session_state["mkt_loaded"] = True
+        if not st.session_state.get("mkt_loaded"):
+            st.info("點上方按鈕載入市場資料（涵蓋近百檔標的；此設計避免開機時一次抓取拖慢啟動）。")
         else:
-            st.info("StockQ 暫時無法連線。")
+            # ── yfinance：指數 / 匯率 / 商品 / 期貨 / 加密 / 殖利率 ──
+            spot = load_spot_indices()
 
-        # ── yfinance：指數(亞/歐/美) + 匯率 + 期貨 + 加密/波動 ──
-        spot = load_spot_indices()
-        if spot:
             def _mk_cards(mapping, suffix=""):
                 cs = []
                 for grp, lst in mapping.items():
@@ -2548,21 +2553,67 @@ def main():
                     if items:
                         cs.append(_quote_card_html(grp + suffix, items, price_hdr="現價"))
                 return cs
-            st.markdown("###### 全球指數（yfinance）")
-            _sq_wall(_mk_cards(_INDEX_MAP, "股市指數"), min_px=280)
-            st.markdown("###### 匯率 · 期貨 · 加密/波動（yfinance）")
-            _sq_wall(_mk_cards(_QUOTE_MAP), min_px=260)
-        else:
-            st.warning("yfinance 現貨抓取失敗；請確認 requirements.txt 含 yfinance、稍後再試。")
 
-        st.caption("來源：StockQ wide.php（商品/MSCI/債券）＋ yfinance（指數/匯率/期貨/加密）。列印 Ctrl+P。")
+            if spot:
+                st.markdown("###### 全球股市指數（yfinance）")
+                _sq_wall(_mk_cards(_INDEX_MAP, "股市指數"), min_px=280)
+                st.markdown("###### 匯率 · 商品 · 期貨 · 加密/波動 · 公債殖利率（yfinance）")
+                _sq_wall(_mk_cards(_QUOTE_MAP), min_px=260)
+            else:
+                st.warning("yfinance 抓取失敗或逾時（可能限流）；稍等再按重新整理。")
+
+            # ── StockQ msci.php：MSCI 指數(靜態有真值) ──
+            st.markdown("###### MSCI 指數（StockQ · 單日/本月/三個月/今年/1年/3年/5年/10年）")
+            _mt = load_msci_stockq()
+            if _mt:
+                msci_specs = [
+                    ("MSCI 世界／新興／亞太", ["世界指數", "新興市場指數"]),
+                    ("MSCI 歐洲各國", ["歐洲指數", "德國指數"]),
+                    ("MSCI 美洲／非中東", ["北美洲指數", "巴西指數"]),
+                ]
+                mcards = []
+                for title, kws in msci_specs:
+                    df = _sq_find(_mt, *kws)
+                    if df is None and len(kws) > 1:
+                        df = _sq_find(_mt, kws[0])
+                    if df is not None:
+                        h = _sq_card_from_df(df, title, max_rows=200)
+                        if h:
+                            mcards.append(h)
+                if mcards:
+                    _sq_wall(mcards, min_px=420)
+                else:
+                    st.caption("（MSCI 暫時解析不到，StockQ 結構可能調整。）")
+            else:
+                st.caption("（MSCI 暫時無法連線 StockQ。）")
+
+        st.caption("來源：yfinance（指數/匯率/商品/期貨/加密/殖利率）＋ StockQ msci.php（MSCI）。"
+                   "完整度對照見交付文件。列印 Ctrl+P。")
 
     # ══ 📊 漲跌排行（StockQ /market/：所有期間一次展開，上漲下跌兩牆）══
     with tab_movers:
         _icon_title("scan", "漲跌排行（StockQ 全球股市）")
-        st.caption("各期間表現最好/最差的股市，所有期間一次展開。綠漲紅跌(我們慣例)。"
-                   "live 抓 StockQ、約5分快取。")
+        _mvt = _market_fetch_time()
         _mt = _stockq_tables("https://www.stockq.org/market/")
+        # 嘗試從 StockQ 表頭/首列抓「資料日 MM/DD」(一日榜的基準日)
+        _dtxt = ""
+        try:
+            for t in (_mt or [])[:6]:
+                blob = " ".join(str(x) for x in list(t.columns) + list(t.values.ravel()[:20]))
+                m = _sqre.search(r"(\d{1,2}/\d{1,2})", blob)
+                if m:
+                    _dtxt = m.group(1)
+                    break
+        except Exception:
+            _dtxt = ""
+        st.markdown(
+            '<div style="background:#003781;color:#fff;border-radius:8px;'
+            'padding:8px 14px;margin:2px 0 6px;font-size:.9rem;font-weight:600">'
+            '🕒 資料日：{}　·　擷取時間 {} （台北）　·　來源 StockQ /market/　·　綠漲紅跌</div>'
+            .format(_dtxt or "最近交易日", _mvt.strftime("%m-%d %H:%M")),
+            unsafe_allow_html=True)
+        st.caption("各期間表現最好/最差的股市，所有期間一次展開（母體＝StockQ 收錄的全球股市指數，"
+                   "與 StockQ 排行一致）。")
         if not _mt:
             st.warning("暫時無法連線 StockQ（或該站結構調整）。稍後再試。")
         else:
@@ -2585,7 +2636,10 @@ def main():
                     half = len(movers) // 2
 
                     def _label(i):
-                        return _periods[i] if i < len(_periods) else "期間{}".format(i + 1)
+                        base = _periods[i] if i < len(_periods) else "期間{}".format(i + 1)
+                        if i == 0 and _dtxt:      # 「一日」附上資料日
+                            base = "{} ({})".format(base, _dtxt)
+                        return base
 
                     # 上牆：各期間「漲最多」
                     st.markdown("#### 📈 各期間表現最好")
