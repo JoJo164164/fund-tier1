@@ -1038,6 +1038,29 @@ def load_msci_stockq():
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def load_cnyes_map():
+    """從 Release 讀 cnyes_map.json（SITCA→cnyes代碼）。失敗回空 dict。"""
+    import urllib.request as _u
+    import json as _j
+    try:
+        _download_asset("cnyes_map.json")
+        p = os.path.join("data", "cnyes_map.json")
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as f:
+                return _j.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _to_cnyes_code(code):
+    """把我們庫代碼轉成 cnyes 明細代碼：境內查 SITCA 對映表；境外(或查無)用原碼(已是cnyes碼)。"""
+    m = load_cnyes_map()
+    sitca = m.get("sitca", {}) if isinstance(m, dict) else {}
+    return sitca.get(str(code)) or str(code)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_cnyes_detail(name, code):
     """抓 cnyes 基金明細頁『績效表現』表(晨星資料，SSR 靜態可解析)。
     回 dict：{found, url, update, periods:[..], rows:{標籤:{期間:值}}}。失敗回 {found:False}。
@@ -2276,7 +2299,8 @@ def main():
                             st.info("此檔在 MoneyDJ 無對應官方績效（可能名稱/類股差異）。滾動跌幅與回測分析不受影響，見下方。")
 
                         # 🐝 cnyes 晨星明細（基金績效/基準指數/同組平均/贏過N%，比 MoneyDJ 完整）
-                        _cd = load_cnyes_detail(_pname, code_a)
+                        _ccode = _to_cnyes_code(code_a)   # 境內 SITCA→cnyes 代碼；境外用原碼
+                        _cd = load_cnyes_detail(_pname, _ccode)
                         _icon_title("cmp", "cnyes 明細（晨星）")
                         if _cd.get("found"):
                             _periods_c = _cd["periods"]
@@ -2592,32 +2616,55 @@ def main():
             ret_cols = ["一個月%", "三個月%", "六個月%", "一年%", "三年%", "五年%", "十年%"]
             base_cols = [c for c in ["名稱", "發行", "系列", "_境內外", "投資區域"] if c in v.columns]
             vv = v[base_cols + [c for c in ret_cols if c in v.columns]].copy()
+            # ★清理：報酬欄一律轉數值(None/空字串→NaN→顯示「—」不再紅色None)
+            for c in ret_cols:
+                if c in vv.columns:
+                    vv[c] = pd.to_numeric(
+                        vv[c].astype(str).str.replace("%", "", regex=False)
+                        .str.replace(",", "", regex=False), errors="coerce")
+            # 文字欄 None/nan → 空白
+            for c in base_cols:
+                vv[c] = (vv[c].astype(str).str.strip()
+                         .replace({"None": "", "nan": "", "NaN": "", "none": ""}))
             if period in vv.columns:
                 vv = vv.sort_values(period, ascending=False, na_position="last")
             vv = vv.reset_index(drop=True)
             vv = vv.rename(columns={"_境內外": "境內外", "發行": "發行公司"})
-            # 隱藏整欄皆空的欄位（如篩選後發行/系列/區域全無）
-            for c in list(vv.columns):
-                col = vv[c]
-                if col.isna().all() or (col.astype(str).str.strip() == "").all():
+            # 隱藏整欄皆空的文字欄
+            for c in ["發行公司", "系列", "投資區域", "境內外"]:
+                if c in vv.columns and (vv[c].astype(str).str.strip() == "").all():
                     vv = vv.drop(columns=[c])
-            # 名稱最前 + 名次
             vv.insert(0, "名次", range(1, len(vv) + 1))
-            cols = ["名稱", "名次"] + [c for c in vv.columns if c not in ("名稱", "名次")]
-            vv = vv[cols]
-            st.success("**{} 檔**（依 {} 由高到低）。負報酬標紅；點欄位標題可改排序。".format(len(vv), period))
 
-            _ret = [c for c in ret_cols if c in vv.columns]
-            _sty = vv.style
-            if _ret:
-                _sty = _sty.apply(_heat_neg(-30), subset=_ret)      # 只負紅、不要綠
-            _sty = _sty.format({c: "{:.2f}%" for c in _ret}, na_rep="—").set_properties(
+            # ★預設精簡(只排序期間+一年參考)，可勾選展開全部 → 好讀不擠
+            show_all = st.checkbox("顯示所有期間報酬（預設只顯示排序期間，較好讀）",
+                                   value=False, key="rk_all")
+            info_cols = [c for c in ["名次", "名稱", "發行公司", "系列", "境內外", "投資區域"]
+                         if c in vv.columns]
+            if show_all:
+                ret_show = [c for c in ret_cols if c in vv.columns]
+            else:
+                ret_show = [period] + (["一年%"] if period != "一年%" and "一年%" in vv.columns else [])
+                ret_show = [c for c in ret_cols if c in ret_show]
+            disp = vv[info_cols + ret_show].copy()
+
+            st.success("**{} 檔**（依 {} 由高到低）。負報酬標紅、缺值顯示「—」；"
+                       "點欄位標題可改排序。".format(len(disp), period))
+            _sty = disp.style
+            if ret_show:
+                _sty = _sty.apply(_heat_neg(-30), subset=ret_show)
+                if period in disp.columns:      # 標亮排序欄
+                    _sty = _sty.set_properties(
+                        subset=[period], **{"background-color": "#EAF3FB", "font-weight": "700"})
+            _sty = _sty.format({c: "{:.2f}%" for c in ret_show}, na_rep="—").set_properties(
                 subset=["名稱"], **{"text-align": "left"})
             st.dataframe(_sty, use_container_width=True, height=620, hide_index=True)
-            st.download_button("⬇️ 下載 CSV", vv.to_csv(index=False).encode("utf-8-sig"),
+            st.download_button("⬇️ 下載 CSV（含所有期間）",
+                               vv.to_csv(index=False).encode("utf-8-sig"),
                                file_name="ranking_{}.csv".format(dt.date.today()), mime="text/csv")
-            st.caption("報酬為官方數字(MoneyDJ,考慮配息)。發行公司/系列以基金名對應官方分類，"
-                       "對不到者不顯示該欄。風險指標(標準差/Sharpe)因境內來源未提供，改於個別分析呈現。")
+            st.caption("報酬為官方數字(MoneyDJ,考慮配息)。預設只顯示排序期間+一年較好讀，"
+                       "勾選上方可看全部期間；下載 CSV 一律含全部期間。"
+                       "風險指標(標準差/Sharpe)因境內來源未提供，改於個別分析呈現。")
 
     # ══ 🌍 市場狀況（yfinance 指數/匯率/商品/期貨/加密/殖利率 + StockQ MSCI）══
     #   ★真相：StockQ 指數/匯率/期貨即時價是 JS 動態 read_html 抓到空 → 全改 yfinance；
