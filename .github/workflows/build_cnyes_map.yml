@@ -1,0 +1,36 @@
+name: 建置 cnyes 代碼對映表 (SITCA→cnyes)
+
+# 一次性/偶爾跑：列舉 cnyes 全部基金，產出 SITCA→cnyes明細代碼 對映，上傳 Release。
+# app 個別基金分析用它把境內 SITCA 代碼換成 cnyes 代碼，才抓得到 cnyes 明細。
+# 境外不需要(我們庫代碼已是 cnyes 代碼)。跑法：Actions → 本 workflow → Run。
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 16 * * 1'   # 每週一 台北 00:00 更新一次(新基金)
+
+permissions:
+  contents: write
+
+jobs:
+  cnyes_map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests
+      - name: 列舉 cnyes → 建 SITCA 對映
+        run: python -u build_cnyes_map.py
+      - name: 上傳 cnyes_map.json 到 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          test -f data/cnyes_map.json || { echo "❌ 沒產出 cnyes_map.json"; exit 1; }
+          gh release view data-latest >/dev/null 2>&1 || \
+            gh release create data-latest --title "資料庫快照(app 由此讀取)" --notes "自動維護"
+          gh release upload data-latest data/cnyes_map.json --clobber
+          echo "✅ cnyes_map.json 已上傳 Release"
