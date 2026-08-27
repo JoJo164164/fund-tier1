@@ -69,6 +69,9 @@ def _heat_neg(vmin):
             except Exception:
                 res.append("")
                 continue
+            if x != x:           # NaN → 不上色(缺值不是要注意的地方)
+                res.append("")
+                continue
             if x >= 0:
                 res.append("")
                 continue
@@ -1078,11 +1081,26 @@ def load_cnyes_map():
     return {}
 
 
-def _to_cnyes_code(code):
-    """把我們庫代碼轉成 cnyes 明細代碼：境內查 SITCA 對映表；境外(或查無)用原碼(已是cnyes碼)。"""
+def _to_cnyes_code(code, name=""):
+    """我們庫代碼 → cnyes 明細代碼。境內查 sitca；境外查 code(cnyesId去逗號→現行fundYesId)；
+    再退名稱備援；全查不到才用原碼。"""
     m = load_cnyes_map()
-    sitca = m.get("sitca", {}) if isinstance(m, dict) else {}
-    return sitca.get(str(code)) or str(code)
+    if not isinstance(m, dict):
+        return str(code)
+    c = str(code)
+    hit = (m.get("sitca", {}).get(c)
+           or m.get("code", {}).get(c)
+           or m.get("code", {}).get(c.upper())
+           or m.get("code", {}).get(c.lower()))
+    if hit:
+        return hit
+    if name:
+        import re as _r
+        nm = _r.sub(r"\s+", "", str(name).replace("（", "(").replace("）", ")")).lower()
+        hit = m.get("name", {}).get(nm)
+        if hit:
+            return hit
+    return c
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -2328,7 +2346,7 @@ def main():
                             st.info("此檔在 MoneyDJ 無對應官方績效（可能名稱/類股差異）。滾動跌幅與回測分析不受影響，見下方。")
 
                         # 🐝 cnyes 晨星明細（仿 cnyes 版面）
-                        _ccode = _to_cnyes_code(code_a)   # 境內 SITCA→cnyes 代碼；境外用原碼
+                        _ccode = _to_cnyes_code(code_a, _pname)   # 境內sitca/境外code/名稱備援
                         _cd = load_cnyes_detail(_pname, _ccode)
                         _icon_title("cmp", "cnyes 明細（晨星）")
                         if _cd.get("found"):
