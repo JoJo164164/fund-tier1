@@ -2532,21 +2532,27 @@ def main():
             c_thr = g6.number_input("觸發門檻(%)", value=-10.0, step=0.5, max_value=0.0, key="c_thr")
 
             codes = vc["代碼"].dropna().unique().tolist()
-            st.caption("篩選後 {} 檔。比較會逐檔跑歷史回測，建議 ≤ 60 檔。".format(len(codes)))
+            st.caption("篩選後 {} 檔。系統先對全部做輕量海選、再只對前 N 名跑完整回測"
+                       "（不用你手動縮檔數）。".format(len(codes)))
+            s1, s2 = st.columns([2, 1])
+            _sortby = s1.selectbox(
+                "海選排序（決定深算哪些）",
+                ["當前滾動跌幅（跌最深優先·找抄底）", "官方一年報酬（最高優先·找強者）"],
+                key="c_sortby")
+            _deepn = s2.radio("深算前", [30, 40, 60], horizontal=True, key="c_deepn")
 
             if st.button("🆚 比較這一類", type="primary"):
                 if len(codes) == 0:
                     st.warning("沒有符合的基金，請放寬條件。")
-                elif len(codes) > 60:
-                    st.warning("這一類有 {} 檔，太多了（逐檔回測會很久）。請再用發行公司/系列/區域縮到 ≤ 60 檔。".format(len(codes)))
                 else:
                     thr = float(c_thr)
-                    rows = []
                     _pmap = load_prices_for_codes(tuple(codes))   # 只讀這組基金，不全載
-                    _, _cmp_plut = load_performance()              # 官方績效 join 用
+                    _, _cmp_plut = load_performance()
                     _meta = vc.drop_duplicates("代碼").set_index("代碼")
-                    prog = st.progress(0.0)
-                    for i, code in enumerate(codes):
+
+                    # ── Stage 1：海選（全部，輕量：滾動跌幅 + 官方一年報酬）──
+                    light = []
+                    for code in codes:
                         prices = _pmap.get(code, {})
                         if len(prices) < ROLL_N + 1:
                             continue
@@ -2561,50 +2567,76 @@ def main():
                                 consec += 1
                             else:
                                 break
-                        best_wr, best_h, n_hist = None, None, 0
-                        bt = run_full_backtest(prices, thr, rolling, 0, 0.0, 0.0, max_span)
-                        if bt:
-                            n_hist = bt.get("觸發次數", 0)
-                            tbl = build_entry_timing_table(bt)
-                            bi = _pick_best_timing_idx(tbl)
-                            if bi is not None:
-                                best_wr = tbl.loc[bi, "勝率"]
-                                best_h = tbl.loc[bi, "持有天數"]
                         _row = _meta.loc[code] if code in _meta.index else None
                         nm = str(_row["名稱"]) if _row is not None and "名稱" in _meta.columns else ""
                         ser = str(_row["系列"]) if _row is not None and "系列" in _meta.columns else ""
                         _pf = _perf_lookup(nm, _cmp_plut) or {}
-                        rows.append({
-                            "代碼": code, "名稱": nm[:36], "系列": ser,
-                            "滾動10日%": round(last["return"], 2),
-                            "今日觸發": "🔴" if triggered else "—",
-                            "連續觸發天": consec,
-                            "官方一年%": _pf.get("一年%"),
-                            "官方三年%": _pf.get("三年%"),
-                            "官方Sharpe": _pf.get("Sharpe"),
-                            "官方排名": _pf.get("排名"),
-                            "歷史最佳勝率": best_wr if best_wr else "—",
-                            "最佳持有天": best_h if best_h else "—",
-                            "淨值最新日": last["date"],
-                            "資料品質": "✅" if last["valid"] else "⚠️稀疏",
-                        })
-                        prog.progress((i + 1) / len(codes))
-                    prog.empty()
-
-                    if not rows:
+                        _y1 = _pf.get("一年%")
+                        light.append({"code": code, "prices": prices,
+                                      "名稱": nm[:36], "系列": ser,
+                                      "滾動10日%": round(last["return"], 2),
+                                      "今日觸發": "🔴" if triggered else "—",
+                                      "連續觸發天": consec,
+                                      "官方一年%": _y1, "官方三年%": _pf.get("三年%"),
+                                      "官方Sharpe": _pf.get("Sharpe"), "官方排名": _pf.get("排名"),
+                                      "淨值最新日": last["date"],
+                                      "資料品質": "✅" if last["valid"] else "⚠️稀疏"})
+                    if not light:
                         st.warning("這一類沒有可比較的資料（可能淨值太少）。")
                     else:
-                        cdf = pd.DataFrame(rows).sort_values("滾動10日%")
+                        # ── 海選排序 → 取前 N 深算 ──
+                        if _sortby.startswith("當前滾動跌幅"):
+                            light.sort(key=lambda r: r["滾動10日%"])          # 最負在前
+                        else:
+                            light.sort(key=lambda r: -(r["官方一年%"] if isinstance(
+                                r["官方一年%"], (int, float)) else -1e18))     # 高在前
+                        deep_set = set(r["code"] for r in light[:_deepn])
+
+                        # ── Stage 2：只對前 N 深算完整回測（重）──
+                        prog = st.progress(0.0)
+                        _done = 0
+                        for r in light:
+                            if r["code"] in deep_set:
+                                _rolling = calc_all_rolling_returns(r["prices"], ROLL_N, max_span)
+                                best_wr = best_h = None
+                                n_hist = 0
+                                bt = run_full_backtest(r["prices"], thr, _rolling, 0, 0.0, 0.0, max_span)
+                                if bt:
+                                    n_hist = bt.get("觸發次數", 0)
+                                    tbl = build_entry_timing_table(bt)
+                                    bi = _pick_best_timing_idx(tbl)
+                                    if bi is not None:
+                                        best_wr = tbl.loc[bi, "勝率"]
+                                        best_h = tbl.loc[bi, "持有天數"]
+                                r["歷史最佳勝率"] = best_wr if best_wr else "—"
+                                r["最佳持有天"] = best_h if best_h else "—"
+                                r["觸發次數"] = n_hist
+                                _done += 1
+                                prog.progress(_done / min(_deepn, len(deep_set)))
+                            else:
+                                r["歷史最佳勝率"] = "·未深算"
+                                r["最佳持有天"] = "·"
+                                r["觸發次數"] = "·"
+                        prog.empty()
+
+                        # ── 呈現：全部(輕)，前 N 另有勝率；預設按跌幅排 ──
+                        show_cols = ["名稱", "系列", "滾動10日%", "今日觸發", "連續觸發天",
+                                     "官方一年%", "官方三年%", "官方Sharpe", "官方排名",
+                                     "歷史最佳勝率", "最佳持有天", "觸發次數", "淨值最新日", "資料品質"]
+                        rows = [{k: r.get(k) for k in show_cols} for r in light]
+                        cdf = pd.DataFrame(rows).sort_values("滾動10日%").reset_index(drop=True)
                         n_trig = int((cdf["今日觸發"] == "🔴").sum())
-                        st.success("**這一類共 {} 檔，今天有 {} 檔觸發跌幅。** 表已按跌幅排序（跌最深在最上）。"
-                                   "點欄位標題可改排序（例如按『歷史最佳勝率』找高勝率的）。".format(len(cdf), n_trig))
-                        st.dataframe(cdf.reset_index(drop=True), use_container_width=True, height=560,
-                                     hide_index=True)
+                        st.success("**這一類 {} 檔，今天 {} 檔觸發跌幅；已深算前 {} 名（依{}）。** "
+                                   "表按跌幅排序；點欄位標題可改排序。".format(
+                                       len(cdf), n_trig, min(_deepn, len(deep_set)),
+                                       "跌幅" if _sortby.startswith("當前") else "官方一年報酬"))
+                        st.dataframe(cdf, use_container_width=True, height=560, hide_index=True)
                         st.download_button(
                             "⬇️ 下載比較 CSV", cdf.to_csv(index=False).encode("utf-8-sig"),
                             file_name="compare_{}.csv".format(dt.date.today()), mime="text/csv")
-                        st.caption("判讀：同類裡「🔴今天觸發 + 歷史最佳勝率高 + 觸發次數夠(≥10)」= 現在較值得進場。"
-                                   "勝率為觸發後最佳持有天的回測值，樣本太少不顯示。列印用 Ctrl+P。")
+                        st.caption("兩段式：先海選全部、再只深算前 N（省時不漏強者）。"
+                                   "「·未深算」= 不在前 N；想深算它就改海選排序或縮篩選。"
+                                   "判讀：🔴今日觸發 + 歷史最佳勝率高 + 觸發次數≥10 = 現在較值得進場。")
 
     # ══ 績效 Ranking（MoneyDJ 官方報酬/風險/排名）══
     with tab_rank:
